@@ -1,0 +1,806 @@
+================================================================================
+BUKU PEDOMAN AGENT ARC-AGI-3 UNTUK KAGGLE
+================================================================================
+
+Tujuan dokumen:
+Membantu memahami agent yang sudah ada, apa yang boleh diubah,
+seberapa jauh exploration dilakukan, dan kapan agent berhenti mencoba.
+
+Target utama:
+Menang di Kaggle ARC Prize competition, bukan mengejar Verified Leaderboard.
+
+Sumber utama:
+- ARC_AGI_3_Technical_Report.txt
+- Kaggle ARC Prize 2026 - ARC-AGI-3 Rules
+- Tufa Labs ARC3 milestone write-up
+- Source agent pada folder one/src/
+
+Catatan penting:
+Aturan Kaggle yang berlaku adalah aturan kompetisi terbaru di halaman Kaggle.
+Dokumen teknis ARC-AGI-3 menjelaskan tujuan benchmark dan Verified Leaderboard.
+Keduanya jangan dicampur.
+
+================================================================================
+BAB 1 — KITA SEDANG MENGIKUTI JALUR YANG MANA?
+================================================================================
+
+A. KAGGLE ARC PRIZE COMPETITION
+--------------------------------
+Ini target kita.
+
+Tujuan:
+- Mendapat skor private leaderboard setinggi mungkin.
+- Menyelesaikan game private yang belum kita lihat.
+- Menjaga submission reproducible dan open source.
+
+Untuk jalur Kaggle, pendekatan berikut dipakai oleh Tufa Labs dan cocok
+sebagai arah riset:
+
+- Model lokal open source.
+- Custom inference harness.
+- Python REPL/tool untuk membaca frame dan menjalankan aksi.
+- History dari game yang sedang berjalan.
+- World model.
+- Segmentation.
+- Context management.
+- Search dan hypothesis testing.
+
+Yang tetap tidak boleh:
+
+- Memasukkan jawaban manusia untuk validation/test data.
+- Hand-label private/test data.
+- Membawa file game private yang tidak diberikan lewat submission.
+- Hardcode solusi game tertentu.
+- Mengakses internet saat evaluasi jika environment kompetisi mematikannya.
+- Mengambil atau membagikan data kompetisi secara tidak sah.
+- Menyembunyikan source atau metode yang diwajibkan untuk open-source prize.
+
+B. VERIFIED / OFFICIAL MODEL LEADERBOARD
+----------------------------------------
+Jalur ini berbeda. Tujuannya mengukur model general-purpose tanpa
+handholding khusus ARC-AGI-3.
+
+Report teknis menyebut evaluasi ini tidak memakai custom harness sebagai
+bagian dari perbandingan model yang setara.
+
+Kesimpulan:
+- Untuk target Kaggle: gunakan custom harness generic.
+- Untuk klaim Verified AGI: jangan menyamakan skor custom harness dengan
+  skor model tanpa harness.
+
+================================================================================
+BAB 2 — GAMBARAN AGENT YANG SUDAH ADA
+================================================================================
+
+Agent existing berada terutama pada:
+
+one/src/ARC3-Inference/inference/agent/
+
+File penting:
+
+1. tool_agent.py
+   Mengatur panggilan model, Python tool, context, dan eksekusi aksi.
+
+2. runtime_state.py
+   Menyediakan frame, history, transition, dan hasil action.
+
+3. prompts.py
+   Menyusun instruksi agent.
+
+4. vision_context.py
+   Mengatur gambar frame yang dikirim ke model.
+
+5. python_tool_sandbox.py
+   Menjalankan kode Python sementara dari model.
+
+6. action_names.py
+   Menyamakan nama aksi antara model dan engine.
+
+Alur existing:
+
+┌─────────────────────────────────────────────────────────────┐
+│ 1. Environment memberi current_frame dan valid_actions       │
+└─────────────────────────────┬───────────────────────────────┘
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│ 2. Model membaca prompt, frame, history, dan world model     │
+└─────────────────────────────┬───────────────────────────────┘
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│ 3. Model memanggil Python tool                              │
+│    Python membaca segmentation atau ascii kecil              │
+└─────────────────────────────┬───────────────────────────────┘
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│ 4. Python memanggil action(actions)                          │
+└─────────────────────────────┬───────────────────────────────┘
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│ 5. Environment mengembalikan frame dan hasil aksi            │
+└─────────────────────────────┬───────────────────────────────┘
+                              ▼
+                    Kembali ke langkah 2
+
+Agent tidak langsung "menebak jawaban akhir".
+Agent memainkan game satu atau beberapa aksi, lalu membaca hasilnya lagi.
+
+================================================================================
+BAB 3 — APA ITU FRAME?
+================================================================================
+
+Frame = foto kondisi game pada satu waktu.
+
+current_frame menyediakan:
+
+- ascii          : tampilan board berbentuk huruf warna.
+- segmentation   : daftar objek yang sudah dikelompokkan.
+- step           : nomor langkah lingkungan.
+- level          : level aktif.
+- shape          : ukuran board.
+
+History = urutan pengalaman:
+
+history[i].action  = aksi yang dijalankan.
+history[i].frame   = frame setelah aksi tersebut.
+
+previous_frame = frame sebelum aksi lingkungan terakhir.
+
+transitions = catatan:
+
+- action
+- before_frame
+- after_frame
+- result
+
+last_action_result biasanya memberi:
+
+- reward
+- score
+- board_changed
+- level_completed
+- game_over
+- run_complete
+- valid_actions
+
+Peringatan:
+`history[-1].frame` adalah frame terbaru setelah aksi terakhir,
+bukan frame sebelum aksi terakhir.
+Untuk perbandingan terbaru gunakan:
+
+previous_frame dibandingkan dengan current_frame
+atau:
+last_transition.before_frame dibandingkan dengan last_transition.after_frame.
+
+================================================================================
+BAB 4 — BAGAIMANA OBJEK DITETAPKAN?
+================================================================================
+
+Objek bukan label seperti "pemain", "musuh", atau "target" dari awal.
+Sistem mula-mula hanya melihat connected component:
+
+Satu objek = sel warna sama yang saling terhubung lewat sisi 4 arah.
+
+Contoh sederhana:
+
+RR..     RR = satu objek merah
+R...     karena tiga R saling terhubung lewat sisi
+..B.
+
+Setiap node segmentation memiliki:
+
+- id
+  Nomor objek pada frame itu.
+
+- color
+  Huruf warna ARC.
+
+- hash
+  Ciri bentuk dan warna yang mengabaikan posisi.
+  Berguna untuk mencari objek serupa di frame berikutnya.
+
+- pixels
+  Jumlah sel objek.
+
+- boundary
+  Titik-titik tepi objek dalam koordinat [row, col].
+
+- children
+  ID objek yang berada sepenuhnya di dalam objek ini.
+
+- adjacency_list
+  Pasangan ID objek yang berbagi sisi.
+
+Klasifikasi awal sebaiknya netral:
+
+┌──────────────────────────────────────────────────────────────┐
+│ Observed object                                               │
+│ color=R, pixels=12, shape=L, position=near edge               │
+└──────────────────────────────────────────────────────────────┘
+
+Jangan langsung menyebutnya target.
+Nama fungsi baru boleh muncul setelah ada bukti dari aksi.
+
+Contoh perubahan klasifikasi:
+
+Awal:
+  Object 3 = garis biru 1xN di tepi board.
+
+Setelah tes:
+  Object 3 berubah panjang setelah setiap aksi.
+
+Klasifikasi sementara:
+  Object 3 = kemungkinan indikator HUD/timer.
+
+Setelah tes kedua:
+  Perubahannya tidak berhubungan dengan reward atau kemenangan.
+
+Klasifikasi lebih kuat:
+  Object 3 = HUD/timer, bukan target gameplay.
+
+Prinsip:
+Bentuk menghasilkan kandidat fungsi.
+Perubahan setelah aksi menghasilkan bukti.
+Bukti berulang menghasilkan klasifikasi.
+
+================================================================================
+BAB 5 — BAGAIMANA AKSI DITETAPKAN?
+================================================================================
+
+`valid_actions` memberi daftar aksi yang boleh dikirim saat ini.
+Jangan menganggap semua game punya aksi yang sama.
+
+Nama yang mungkin muncul:
+
+- UP
+- DOWN
+- LEFT
+- RIGHT
+- SPACE
+- MOUSE dengan row dan col
+- RESET
+
+UNDO kadang tidak diberikan ke model karena pada agent existing,
+model sering memakainya tidak efisien untuk membatalkan batch besar.
+
+Aksi memiliki dua bagian:
+
+1. Jenis aksi
+   Contoh: LEFT, SPACE, MOUSE.
+
+2. Target atau parameter
+   Contoh: MOUSE row=12, col=31.
+
+Aksi diklasifikasikan berdasarkan fungsi yang terlihat setelah dicoba:
+
+┌──────────────────┬─────────────────────────────────────────────┐
+│ Aksi navigasi    │ Menggeser pemain, kursor, atau selector      │
+│ Aksi interaksi   │ Menekan tombol atau memilih objek             │
+│ Aksi lokasi      │ MOUSE pada koordinat tertentu                 │
+│ Aksi reset       │ Mengulang level atau keadaan tertentu         │
+│ Aksi eksplorasi  │ Dipilih untuk memperoleh informasi baru       │
+└──────────────────┴─────────────────────────────────────────────┘
+
+Sebelum aksi:
+- Pastikan nama ada di valid_actions.
+- Untuk MOUSE gunakan row dan col integer.
+- Jangan kirim x/y.
+- Jangan kirim aksi setelah game_over atau level_completed.
+
+Sesudah aksi, ukur:
+
+- Apakah board_changed?
+- Apakah objek gameplay berubah?
+- Apakah hanya HUD berubah?
+- Apakah reward berubah?
+- Apakah level selesai?
+- Apakah aksi memberi informasi baru?
+
+Aksi yang tidak mengubah board belum tentu sia-sia.
+Aksi itu mungkin memberi informasi bahwa target tersebut bukan interaksi.
+Tetapi terlalu banyak aksi tanpa perubahan berarti exploration perlu diganti.
+
+================================================================================
+BAB 6 — APA ITU EXPLORATION?
+================================================================================
+
+Exploration = menjalankan aksi untuk belajar aturan game.
+
+Bukan berarti menekan tombol secara acak tanpa alasan.
+Aksi exploration yang bagus menjawab satu pertanyaan.
+
+Contoh pertanyaan:
+
+- Apakah objek ini bisa diklik?
+- Apakah LEFT menggerakkan objek atau kursor?
+- Apakah warna berubah setelah SPACE?
+- Apakah garis di tepi adalah HUD atau bagian puzzle?
+- Apakah objek merah dan biru saling berhubungan?
+- Apakah aksi ini membuat level pindah?
+
+Siklus exploration yang benar:
+
+1. Buat pertanyaan.
+2. Pilih aksi yang paling jelas menguji pertanyaan.
+3. Jalankan satu aksi bila akibatnya belum diketahui.
+4. Bandingkan frame sebelum dan sesudah.
+5. Catat kesimpulan di world model.
+6. Pilih tes berikutnya atau mulai eksekusi.
+
+Contoh buruk:
+
+CLICK A, CLICK A, CLICK A, CLICK A
+
+Tidak ada pertanyaan baru.
+Tidak ada informasi baru.
+Hanya menghabiskan action budget.
+
+Contoh baik:
+
+Pertanyaan 1: apakah A bisa diklik?
+  → CLICK A
+  → board berubah: ya
+
+Pertanyaan 2: apakah A mengubah warna objek atau hanya posisi kursor?
+  → observasi segmentation dan reward
+
+Pertanyaan 3: apakah B memiliki fungsi yang sama?
+  → CLICK B satu kali
+
+================================================================================
+BAB 7 — SEJAUH MANA EXPLORATION DILAKUKAN?
+================================================================================
+
+Jangan gunakan angka phase sebagai hukum tetap.
+Setiap game punya action budget dan mekanik berbeda.
+Gunakan fase sebagai panduan sederhana.
+
+FASE 0 — ORIENTASI
+-------------------
+Kondisi:
+- Frame awal.
+- Belum tahu tujuan.
+- Belum tahu aksi yang berpengaruh.
+
+Yang dilakukan:
+- Lihat segmentation.
+- Kelompokkan objek berdasarkan bentuk, warna, ukuran, dan posisi.
+- Baca valid_actions.
+- Cari perubahan paling mudah diuji.
+
+Output yang diharapkan:
+- Daftar objek netral.
+- Daftar pertanyaan.
+- Satu aksi uji paling informatif.
+
+Jangan langsung menjalankan batch panjang.
+
+FASE 1 — TES MEKANIK
+---------------------
+Kondisi:
+- Sudah punya beberapa kandidat objek atau aksi.
+
+Yang dilakukan:
+- Uji aksi dengan akibat yang mudah dibedakan.
+- Utamakan aksi yang reversible atau murah.
+- Bandingkan before/after.
+- Bedakan perubahan gameplay dan HUD.
+
+Output yang diharapkan:
+- Action model sementara.
+- Objek yang kemungkinan interaktif.
+- Objek yang kemungkinan dekorasi/HUD.
+
+FASE 2 — BENTUK HIPOTESIS
+--------------------------
+Kondisi:
+- Ada satu atau lebih perubahan yang berulang.
+
+Yang dilakukan:
+- Tulis teori singkat tentang mekanik.
+- Tulis prediksi: "Jika aksi X, maka Y terjadi."
+- Jalankan tes yang paling membedakan teori A dan B.
+- Jangan menguji teori dengan aksi yang sama jika hasilnya belum membedakan.
+
+Output yang diharapkan:
+- Satu hipotesis utama.
+- Satu hipotesis cadangan.
+- Bukti yang mendukung dan yang membantah.
+
+FASE 3 — EKSEKUSI
+------------------
+Masuk fase ini ketika:
+
+- Tujuan cukup jelas.
+- Aksi utama sudah pernah menghasilkan perubahan yang relevan.
+- Prediksi berikutnya punya alasan.
+- Tidak ada pertanyaan dasar yang belum dijawab.
+
+Yang dilakukan:
+- Jalankan urutan aksi pendek.
+- Setelah batch, cek frame baru.
+- Re-ground jika scene berubah atau level naik.
+- Hentikan batch saat terminal state muncul.
+
+FASE 4 — KOREKSI
+-----------------
+Masuk fase ini jika:
+
+- Prediksi gagal.
+- Board tidak berubah beberapa kali.
+- State kembali ke keadaan lama.
+- Hipotesis bertentangan dengan bukti.
+
+Yang dilakukan:
+- Jangan langsung mengulang aksi yang sama.
+- Tulis apa yang salah dari prediksi.
+- Cari aksi yang membedakan hipotesis cadangan.
+- Kembali ke tes mekanik, bukan random spam.
+
+================================================================================
+BAB 8 — KAPAN HARUS BERHENTI EXPLORATION?
+================================================================================
+
+Berhenti exploration ketika tiga hal ini cukup jelas:
+
+1. Goal model
+   Apa keadaan yang tampaknya ingin dicapai?
+
+2. Action model
+   Aksi apa yang mengubah keadaan dan bagaimana caranya?
+
+3. Progress evidence
+   Perubahan apa yang menunjukkan agent bergerak menuju goal?
+
+Checklist sebelum execution:
+
+[ ] Saya tahu perubahan yang dicari.
+[ ] Saya tahu aksi yang mungkin menyebabkannya.
+[ ] Saya punya bukti dari minimal satu tes.
+[ ] Saya punya prediksi untuk aksi berikutnya.
+[ ] Saya tahu cara mendeteksi prediksi gagal.
+
+Jangan menunggu kepastian 100 persen.
+Agent perlu bergerak setelah hipotesis cukup kuat.
+
+Gunakan prinsip:
+
+- Ketidakpastian tinggi → aksi pendek dan informatif.
+- Ketidakpastian sedang → uji hipotesis utama dan cadangan.
+- Ketidakpastian rendah → jalankan rencana pendek.
+- Scene berubah → ulangi orientasi secara ringkas.
+
+================================================================================
+BAB 9 — EXPLORATION POLICY YANG COCOK UNTUK AGENT INI
+================================================================================
+
+Policy = aturan sederhana untuk memilih langkah berikutnya.
+
+Versi pertama yang disarankan:
+
+1. Jika belum ada world model:
+   pilih aksi yang paling banyak memberi informasi.
+
+2. Jika ada hipotesis tetapi belum teruji:
+   pilih aksi yang bisa membedakan dua hipotesis.
+
+3. Jika hipotesis teruji:
+   pilih aksi yang paling dekat ke goal.
+
+4. Jika aksi tidak mengubah gameplay:
+   turunkan prioritas aksi itu.
+
+5. Jika frame berulang:
+   jangan ulangi urutan aksi yang sama tanpa alasan baru.
+
+6. Jika level selesai:
+   kosongkan asumsi khusus level lama dan lihat scene baru.
+
+7. Jika game over:
+   berhenti mengirim aksi dan tunggu reset dari runner.
+
+Action scoring sederhana:
+
+score(action) =
+    information_gain
+  + progress_signal
+  + goal_relevance
+  - action_cost
+  - repetition_penalty
+
+Penjelasan:
+
+- information_gain:
+  Seberapa banyak aksi ini menjawab pertanyaan?
+
+- progress_signal:
+  Apakah aksi sebelumnya yang mirip menghasilkan perubahan baik?
+
+- goal_relevance:
+  Apakah target aksi berhubungan dengan goal model?
+
+- action_cost:
+  Satu aksi tetap punya biaya dalam skor kompetisi.
+
+- repetition_penalty:
+  Penalti jika aksi/urutan sama terus tanpa hasil baru.
+
+Ini bukan memory lintas game.
+Semua nilai hanya berasal dari game yang sedang dimainkan.
+
+================================================================================
+BAB 10 — FRAME BERULANG DAN POLA 4–5 LANGKAH
+================================================================================
+
+Frame berulang adalah sinyal, bukan jawaban otomatis.
+
+Kemungkinan penyebab:
+
+- Aksi memang tidak berpengaruh.
+- Aksi salah target.
+- Game memiliki loop yang sah.
+- Pemain perlu memakai urutan aksi tertentu.
+- Perubahan hanya terjadi pada frame animasi berikutnya.
+- Model salah membaca objek.
+
+Analisis 4–5 langkah:
+
+1. Ambil state terbaru dan empat state sebelumnya.
+2. Bandingkan objek berdasarkan hash, posisi, color, pixels, boundary.
+3. Bandingkan aksi yang memisahkan setiap frame.
+4. Cari apakah state berulang setelah urutan aksi tertentu.
+5. Tanyakan: apakah loop ini memberi informasi atau hanya membuang aksi?
+
+Jika loop tidak memberi informasi:
+- Tandai hipotesis sebagai lemah.
+- Pilih aksi dari tipe berbeda.
+- Jangan otomatis menghapus history.
+
+Jika loop memberi informasi:
+- Simpan kesimpulan di world model.
+- Contoh: "LEFT dan RIGHT hanya menggerakkan cursor; tidak mengubah target."
+- Gunakan informasi itu untuk menyaring aksi berikutnya.
+
+================================================================================
+BAB 11 — FULL MEMORY TANPA MEMBEBANI MODEL
+================================================================================
+
+Kita boleh mempertahankan full history di runtime.
+Tetapi model tidak perlu menerima semua frame mentah setiap turn.
+
+Pemisahan yang benar:
+
+┌─────────────────────────────────────────────────────────────┐
+│ Runtime state                                                │
+│ Full history, transitions, frames, results                   │
+│ Dipakai Python untuk analisis saat dibutuhkan                 │
+└─────────────────────────────┬───────────────────────────────┘
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│ Model context                                                │
+│ Current frame + perubahan terbaru + world model ringkas      │
+│ History lama diambil lewat Python bila memang relevan         │
+└─────────────────────────────────────────────────────────────┘
+
+Dengan cara ini:
+
+- Informasi tidak hilang dari runtime.
+- Prompt tidak membengkak tanpa batas.
+- Model bisa meminta history lama saat diperlukan.
+- Context management tidak sama dengan menghapus pengalaman game.
+
+Tufa memakai pendekatan sejenis:
+- History game tersedia melalui Python.
+- Context model dikelola dan pesan lama dapat dikeluarkan.
+- World model ringkas dibawa ke turn berikutnya.
+
+================================================================================
+BAB 12 — TIMER BAR DAN OBJEK DI TEPI
+================================================================================
+
+Objek garis 1xN di tepi board jangan langsung diklasifikasikan sebagai timer.
+
+Klasifikasi bertahap:
+
+1. Candidate edge object
+   Bentuk garis dan posisinya berada di tepi.
+
+2. Observe change
+   Apakah panjangnya berubah setelah aksi?
+
+3. Check relation
+   Apakah perubahan berhubungan dengan reward, board change,
+   level completion, atau hanya waktu/action count?
+
+4. Assign temporary role
+   - HUD/timer
+   - gameplay object
+   - unknown
+
+5. Skip only after evidence
+   Jika terbukti HUD, jangan masukkan sebagai target aksi utama.
+   Tetap boleh disimpan di runtime untuk memahami batas langkah.
+
+Peringatan dari guidance agent:
+Strip di tepi bisa timer/HUD. Jika aksi hanya mengubah strip sementara
+interior board tidak berubah, jangan klik strip satu per satu.
+
+Jangan mask dua objek secara permanen hanya dari ukuran 1xN.
+Private game bisa memakai garis sebagai bagian gameplay.
+
+================================================================================
+BAB 13 — WORLD MODEL YANG HARUS DITULIS MODEL
+================================================================================
+
+Gunakan catatan pendek, bukan cerita panjang.
+
+Format:
+
+World model:
+- Objects: ...
+- Stable objects: ...
+- Changed objects: ...
+
+Goal model:
+- Goal candidate: ...
+- Evidence: ...
+- Confidence: low/medium/high
+
+Action model:
+- ACTION_A causes ...
+- ACTION_B has no observed effect ...
+- MOUSE at ... causes ...
+
+Recent findings:
+- After action ..., object ... changed from ... to ...
+
+Open questions:
+- Is edge line HUD or gameplay?
+- Does color ... represent target or state?
+
+Plan:
+- Next action ... because it distinguishes ...
+
+World model harus direvisi ketika frame baru membantahnya.
+Jangan mempertahankan asumsi lama hanya karena sudah ditulis.
+
+================================================================================
+BAB 14 — APA YANG PERLU KITA UBAH DI AGENT?
+================================================================================
+
+Prioritas aman untuk eksperimen Kaggle:
+
+1. Perbaiki prompt world model
+   Agent wajib menyebut prediksi singkat sebelum aksi.
+
+2. Perbaiki pemeriksaan hasil aksi
+   Bedakan board_changed, reward, level_completed, dan HUD-only change.
+
+3. Tambahkan analisis 4–5 frame di Python
+   Dipakai untuk pola game aktif, bukan database lintas game.
+
+4. Tambahkan action ranking generik
+   Pilih aksi berdasarkan information gain, progress, dan repetition.
+
+5. Tambahkan batas batch aksi
+   Batch pendek saat belum yakin.
+   Batch panjang hanya setelah rencana sudah terbukti.
+
+6. Perbaiki context management
+   Full runtime history tetap ada.
+   Model menerima ringkasan dan mengambil history lama saat perlu.
+
+7. Uji timer/HUD secara konservatif
+   Jangan hardcode dua node tertentu.
+
+8. Tambahkan diagnostics untuk development
+   Catat alasan aksi, hasil, dan perubahan action count.
+   Jangan masukkan private test traces ke luar aturan kompetisi.
+
+Yang jangan dibuat dulu:
+
+- Database solusi game.
+- Index berdasarkan game ID.
+- Aturan khusus ft09, ls20, vc33, atau game lain.
+- Timer mask permanen berdasarkan posisi saja.
+- Smart abort yang langsung mematikan game hanya karena frame sama sekali.
+
+================================================================================
+BAB 15 — CARA MENGUJI PERUBAHAN
+================================================================================
+
+Gunakan 25 public games untuk development, bukan sebagai bukti private score.
+
+Setiap eksperimen harus menjawab satu pertanyaan:
+
+- Apakah parser membantu model melihat objek?
+- Apakah diff mengurangi aksi berulang?
+- Apakah hypothesis engine mempercepat penemuan goal?
+- Apakah action ranking menurunkan jumlah aksi?
+- Apakah context summary menjaga fakta penting?
+
+Simpan metrik:
+
+- levels_completed
+- total_actions
+- actions_per_level
+- reward
+- board_changed_rate
+- repeated_state_count
+- hypothesis_correct_rate
+- time_used
+- score
+
+Bandingkan:
+
+Baseline:
+  Agent existing tanpa perubahan.
+
+Variant:
+  Hanya satu perubahan baru.
+
+Jangan mengubah lima komponen sekaligus.
+Kalau skor berubah, kita tidak tahu penyebabnya.
+
+Urutan test:
+
+1. Satu game public yang cepat.
+2. Semua 25 public games.
+3. Bandingkan action efficiency.
+4. Cek apakah perubahan membantu banyak game atau hanya satu game.
+5. Submit Kaggle sesuai batas submission.
+
+================================================================================
+BAB 16 — CHECKLIST SEBELUM SUBMISSION KAGGLE
+================================================================================
+
+[ ] Agent berjalan tanpa internet saat evaluation.
+[ ] Semua dependency tersedia di notebook/dataset submission.
+[ ] Tidak ada private game file yang dimasukkan manual.
+[ ] Tidak ada hand-label atau human prediction untuk test data.
+[ ] Tidak ada solusi hardcode per game ID.
+[ ] Model dan source yang digunakan memenuhi open-source requirement.
+[ ] Runtime selesai di bawah batas waktu Kaggle.
+[ ] Full solution bisa direproduksi dari notebook.
+[ ] Aksi tetap memakai valid_actions.
+[ ] Agent berhenti pada level_completed/game_over/run_complete.
+[ ] Batch aksi berhenti jika terminal state muncul.
+[ ] Diagnostics tidak membocorkan data yang dilarang.
+[ ] Public score tidak diperlakukan sebagai private score.
+
+================================================================================
+BAB 17 — RINGKASAN PALING PENDEK
+================================================================================
+
+Objek:
+  Ditemukan dari connected same-color components.
+  Fungsinya tidak diketahui sejak awal.
+  Fungsi ditentukan dari perubahan setelah aksi.
+
+Aksi:
+  Diambil dari valid_actions.
+  Aksi diklasifikasikan dari efeknya terhadap frame dan reward.
+
+Exploration:
+  Aksi untuk menjawab pertanyaan tentang mekanik.
+  Bukan random spam.
+
+Batas exploration:
+  Berhenti ketika goal, action effect, dan progress signal sudah cukup jelas.
+
+Frame berulang:
+  Analisis empat sampai lima langkah terakhir.
+  Jangan langsung menghapus history atau abort.
+  Cari penyebab loop lalu ganti hipotesis jika perlu.
+
+Memory:
+  Full history game aktif boleh dipertahankan.
+  Context model boleh diringkas atau dipangkas.
+  Jangan bawa solusi private atau hardcode game tertentu.
+
+Target:
+  Gunakan 25 public games untuk mengembangkan agent.
+  Nilai kemenangan ditentukan oleh private Kaggle evaluation.
+
+================================================================================
+END OF HANDBOOK
+================================================================================
