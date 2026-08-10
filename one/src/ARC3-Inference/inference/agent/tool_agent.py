@@ -30,7 +30,15 @@ from inference.agent.vision_context import (
 )
 
 from inference.agent.python_tool_sandbox import run_sandboxed_python
-from inference.agent.runtime_state import Frame, HistoryEntry, RUNTIME_STATE_FILENAME, load_runtime_state
+from inference.agent.runtime_state import (
+    Frame,
+    HistoryEntry,
+    RUNTIME_STATE_FILENAME,
+    load_runtime_memory,
+    apply_transition_to_hypotheses,
+    record_expectation,
+    load_runtime_state,
+)
 from inference.utils.openai_compat import build_chat_payload, build_headers
 
 log = logging.getLogger(__name__)
@@ -1220,7 +1228,7 @@ class ToolAgent:
             [
                 state_line,
                 f"Valid actions right now: {_format_valid_action_line(valid_actions)}.",
-                "Only tool: `python`. It receives `current_frame`, `previous_frame`, `history`, `transitions`, `last_transition`, `valid_actions`, `last_action_result`, and `action(actions)`.",
+                "Only tool: `python`. It receives `current_frame`, `previous_frame`, `history`, `transitions`, `last_transition`, `valid_actions`, `last_action_result`, `runtime_memory`, `telemetry`, `hypotheses`, `level_transition`, `last_action_in_valid_action`, and `action(actions)`.",
                 "Only letter-coded board views and lightweight metadata are exposed; raw numeric color IDs are not available.",
                 "Keep tool output compact: use `current_frame.segmentation` as the primary view, and `current_frame.ascii` only for a small specific region; never print full boards.",
                 "For the most recent change, compare `previous_frame` to `current_frame`, or `last_transition.before_frame` to `last_transition.after_frame`; `history[-1].frame` is the current frame, not the previous one.",
@@ -1423,6 +1431,9 @@ class ToolAgent:
             "state": payload.get("state"),
             "valid_actions": payload.get("valid_actions", []),
             "board_changed": bool(payload.get("board_changed")),
+            "no_progress_streak": payload.get("no_progress_streak"),
+            "repeated_action_streak": (payload.get("telemetry") or {}).get("repeated_action_streak"),
+            "same_state_seen_before": (payload.get("telemetry") or {}).get("same_state_seen_before"),
             "done": bool(payload.get("done")),
             "level_completed": bool(payload.get("level_completed")),
             "game_over": bool(payload.get("game_over")),
@@ -1483,6 +1494,7 @@ class ToolAgent:
                 "current_frame": current_frame_payload,
                 "history": _ascii_history_view_payload(refreshed_history),
                 "valid_actions": sanitized_actions,
+                "runtime_memory": load_runtime_memory(state_path),
                 "last_action_result": (
                     dict(persisted_action_result)
                     if isinstance(persisted_action_result, dict)
@@ -1544,11 +1556,18 @@ class ToolAgent:
                 ),
             }
 
+        def _handle_expectation(expectation: dict[str, Any]) -> dict[str, Any]:
+            expectation = dict(expectation)
+            expectation.setdefault("step", current_frame.step if current_frame else None)
+            expectation.setdefault("level", current_frame.level if current_frame else None)
+            return record_expectation(state_path, expectation)
+
         sandbox_result = run_sandboxed_python(
             code=code,
             timeout_seconds=self._python_timeout,
             initial_state=_serialized_runtime_state(),
             action_handler=_handle_action,
+            expectation_handler=_handle_expectation,
         )
 
         action_results = [

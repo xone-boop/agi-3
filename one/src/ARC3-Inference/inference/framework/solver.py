@@ -32,6 +32,9 @@ from inference.agent.runtime_state import (
     Frame,
     HistoryEntry,
     RUNTIME_STATE_FILENAME,
+    frame_state_hash,
+    apply_transition_to_hypotheses,
+    transition_observation,
     write_runtime_state,
 )
 from inference.agent.tool_agent import ToolAgent
@@ -182,6 +185,9 @@ class _HarnessGameSession:
     analysis_step: int = 0
     last_engine_action: str | None = None
     token_baseline: int = 0
+    telemetry: dict[str, Any] = field(default_factory=dict)
+    hypotheses: list[dict[str, Any]] = field(default_factory=list)
+    level_transition: dict[str, Any] = field(default_factory=dict)
     _viewer_events_flushed: int = field(default=0, init=False, repr=False)
 
     def current_frame(self) -> Frame:
@@ -196,6 +202,9 @@ class _HarnessGameSession:
             self.state_path,
             current_frame=self.current_frame(),
             history=self.history_entries,
+            telemetry=self.telemetry,
+            hypotheses=self.hypotheses,
+            level_transition=self.level_transition,
         )
 
     def seed_initial_history(self) -> None:
@@ -203,6 +212,11 @@ class _HarnessGameSession:
             self.history_entries.append(
                 HistoryEntry(action="", frame=self.current_frame())
             )
+        self.telemetry.setdefault("action_count", 0)
+        self.telemetry.setdefault("no_progress_streak", 0)
+        self.telemetry.setdefault("repeated_action_streak", 0)
+        self.telemetry.setdefault("state_hashes", [])
+        self.telemetry.setdefault("transitions", [])
 
     @property
     def action_count(self) -> int:
@@ -434,6 +448,9 @@ class _HarnessGameSession:
                 "level_completed": payload.get("level_completed"),
                 "game_over": payload.get("game_over"),
                 "run_complete": payload.get("run_complete"),
+                "telemetry": payload.get("telemetry"),
+                "last_action_in_valid_action": payload.get("last_action_in_valid_action"),
+                "no_progress_streak": payload.get("no_progress_streak"),
                 "batch_index": payload.get("batch_index"),
                 "batch_size": payload.get("batch_size"),
             }
@@ -674,6 +691,9 @@ class _HarnessGameSession:
         flush_viewer_payload: bool = True,
     ) -> dict[str, Any]:
         previous_grid = _grid_from_state(self.game.current_state)
+        before_frame = self.current_frame()
+        valid_actions_before = to_model_actions(_engine_action_names(self.game))
+        previous_action = self.history_entries[-1].action if self.history_entries else None
         previous_completed = int(self.game.current_state.levels_completed)
         if generated_tokens is None:
             current_tokens = _analyzer_reported_tokens(self.analyzer)
@@ -704,6 +724,67 @@ class _HarnessGameSession:
         level_completed = bool(
             new_state.just_won_level and raw_state != arcengine.GameState.WIN
         )
+        after_frame = current_frame
+        reward_delta = reward
+        no_progress_streak = int(self.telemetry.get("no_progress_streak", 0) or 0)
+        repeated_action_streak = int(self.telemetry.get("repeated_action_streak", 0) or 0)
+        if previous_action and action_display == previous_action:
+            repeated_action_streak += 1
+        else:
+            repeated_action_streak = 0
+        if board_changed and reward_delta == 0:
+            no_progress_streak += 1
+        elif reward_delta or level_completed:
+            no_progress_streak = 0
+        else:
+            no_progress_streak += 1
+        after_hash = frame_state_hash(after_frame)
+        known_hashes = list(self.telemetry.get("state_hashes", []))
+        observation = transition_observation(
+            before_frame,
+            after_frame,
+            action=action_display,
+            valid_actions_before=valid_actions_before,
+            valid_actions_after=to_model_actions(_engine_action_names(self.game)),
+            reward=reward,
+            reward_delta=reward_delta,
+            level_completed=level_completed,
+            game_over=raw_state == arcengine.GameState.GAME_OVER,
+            run_complete=raw_state == arcengine.GameState.WIN,
+            previous_action=previous_action,
+            no_progress_streak=no_progress_streak,
+            recent_actions=known_hashes,
+        )
+        if observation["gameplay_changed"] or reward_delta or level_completed:
+            no_progress_streak = 0
+        observation["no_progress_streak"] = no_progress_streak
+        observation["repeated_action_streak"] = repeated_action_streak
+        observation["environment_step_before"] = before_frame.step
+        observation["environment_step_after"] = after_frame.step
+        observation["same_state_seen_before"] = bool(after_hash and after_hash in known_hashes)
+        self.hypotheses = apply_transition_to_hypotheses(self.hypotheses, observation)
+        self.telemetry["action_count"] = self.action_count
+        self.telemetry["no_progress_streak"] = no_progress_streak
+        self.telemetry["repeated_action_streak"] = repeated_action_streak
+        if after_hash:
+            known_hashes.append(after_hash)
+        self.telemetry["state_hashes"] = known_hashes[-64:]
+        transitions = list(self.telemetry.get("transitions", []))
+        transitions.append(observation)
+        self.telemetry["transitions"] = transitions[-32:]
+        if level_completed:
+            self.level_transition = {
+                "level_before": before_frame.level,
+                "level_after": after_frame.level,
+                "last_two_frames": [
+                    {"grid": [list(row) for row in entry.frame.grid], "step": entry.frame.step, "level": entry.frame.level}
+                    for entry in self.history_entries[-3:-1]
+                ],
+                "last_five_actions": [entry.action for entry in self.history_entries[-6:-1]],
+                "transition_action": action_display,
+                "transition_result": observation,
+            }
+        self.write_runtime_state()
         payload = {
             "executed": True,
             "action_num": self.action_count,
@@ -713,6 +794,9 @@ class _HarnessGameSession:
             "state": raw_state.name,
             "valid_actions": to_model_actions(_engine_action_names(self.game)),
             "board_changed": board_changed,
+            "telemetry": observation,
+            "last_action_in_valid_action": observation["last_action_in_valid_action"],
+            "no_progress_streak": no_progress_streak,
             "done": raw_state == arcengine.GameState.WIN,
             "level_completed": level_completed,
             "game_over": raw_state == arcengine.GameState.GAME_OVER,
