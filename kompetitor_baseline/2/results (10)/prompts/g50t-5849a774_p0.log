@@ -1,0 +1,759 @@
+LATEST MODEL CALL SNAPSHOT
+model: Qwen/Qwen3.8-27B-FP8
+base_url: http://127.0.0.1:1234/v1
+analysis_step: 10
+action: 24
+request_index_within_turn: 1
+message_count: 11
+tool_choice: auto
+
+[AVAILABLE TOOLS]
+- python: Run one ephemeral Python snippet against preloaded ASCII game state. Available globals: `current_frame`, `previous_frame`, `history`, `transitions`, `last_transition`, `valid_actions`, `last_action_result`, `action(actions)` for executing one or more real environment actions. `current_frame` and each `history[*].frame` expose only `.ascii`, `.segmentation`, `.step`, and `.level`; `history[-1].frame` is the current post-action frame, not the previous frame. For before/after diffs, compare `previous_frame` to `current_frame` or use `last_transition.before_frame` and `.after_frame`. For MOUSE, pass `row` and `col` integer fields; legacy x/y fields are rejected. The raw numeric grid is not available. Use `.segmentation` as the primary view; use `.ascii` only to read a small, specific region. Use `print(...)` for compact output or assign final data to `result`.
+
+[MODEL INPUT]
+[SYSTEM]
+You are a coding agent solving a grid-based puzzle game.
+Game overview:
+- You are solving a multi-level grid puzzle game. 
+- You are called repeatedly over the course of a run. Treat each turn as one observe-plan-act cycle: re-understand the current state from the newest frame, update your working world model in Python, choose the next best action or short sequence against the goal as currently understood, execute it, and expect to re-evaluate on the next turn from the updated state.
+- Your job is to solve the entire game by clearing every level, not just the current screen.
+- Levels often build on earlier mechanics, but layouts and interactions can still change between levels.
+- Optimize for as few in-game actions as possible while still being reliable.
+- In this environment, boards are presented as 64 x 64 color grids rendered with ARC color symbols.
+- Color legend: W=white, w=light gray, g=gray, G=dark gray, c=charcoal, B=black, M=magenta, P=pink, R=red, b=blue, S=sky blue, Y=yellow, O=orange, r=dark red, N=light green, p=purple.
+Runtime variables inside every `python` tool call:
+- `current_frame` is a lightweight frame view for the latest environment state.
+- `current_frame` exposes only `.ascii`, `.step`, `.level`, `.shape`, and `.segmentation`.
+- `current_frame.ascii` is a single newline-delimited string containing the latest board rendered with the letter-coded ARC color symbols.
+- `current_frame.segmentation` parses the board into objects. It returns `{'nodes': [...], 'adjacency_list': [...]}`.
+- Each node in `segmentation['nodes']` is one 4-connected same-color object with: `id` (index, ordered top-most-left-most), `color` (ARC color character), `hash` (a signature of the object's color and shape that ignores its position -- equal hashes mean the same object regardless of where it is, so use it to track an object across frames or to spot multiple identical objects in one frame), `pixels` (cell count), `boundary` (clockwise outer-perimeter corner points as `[row, col]`), and `children` (ids of objects fully enclosed by this one).
+- `segmentation['adjacency_list']` is a list of `[i, j]` node-id pairs whose objects share an edge.
+- `current_frame.step` is the current environment step count.
+- `current_frame.level` is the current level number.
+- `current_frame.shape` is a `(rows, cols)` tuple.
+- The raw numeric grid is intentionally not exposed. Use `current_frame.segmentation` as your primary view of the board -- objects, colors, shapes, containment, adjacency, and cross-frame object hashes. Use `current_frame.ascii` only to read a small, specific region; do not scan the whole board with it.
+- `history` is a chronological list of action/frame snapshots.
+- `history` is a Python list of objects, not a dict.
+- Each history entry exposes only `.action` and `.frame`; entries are not subscriptable like `entry['action']`.
+- Each `history[i].frame` is the frame after `history[i].action`; each frame exposes only `.ascii`, `.step`, `.level`, `.shape`, and `.segmentation`.
+- Important history semantics: when `history` is non-empty, `history[-1].frame` is the same latest/post-action board as `current_frame`. It is not the previous board. To inspect the state before the latest action, use `previous_frame` or `history[-2].frame` when available.
+- `previous_frame` is the frame before the most recent real environment action, or `None` if no previous frame is available.
+- `last_action` is the most recent real environment action name/display, or `None` before any real action.
+- `last_action_frame` is the post-action frame for `last_action`; it matches `current_frame` after a real action.
+- `transitions` is a chronological list of actual action transitions, excluding the initial seeded frame. Each transition exposes `.action`, `.before_frame`, `.after_frame`, `.frame` (alias of `.after_frame`), and `.result`.
+- `last_transition` is `transitions[-1]` or `None`. Its `.result` mirrors `last_action_result`; older transitions may have an empty `.result`. For before/after diffs, compare `last_transition.before_frame` to `last_transition.after_frame`; do not compare `current_frame` to `history[-1].frame`.
+- `last_action_result` is the persisted result dict from the most recent `action(...)` call. It remains available across later Python inspection calls that do not call `action(...)`, and is `{}` before any action result exists. Read transition metadata from fields/keys such as `last_action_result['board_changed']`, `last_action_result['done']`, `last_action_result['level_completed']`, `last_action_result['game_over']`, `last_action_result['run_complete']`, `last_action_result['reward']`, and `last_action_result['valid_actions']`.
+- `valid_actions` is the current list of valid action names.
+- Call `action(actions)` to execute one or more real environment actions from Python.
+- Pass `action(actions)` a list like `['LEFT']` or `[{'action': 'MOUSE', 'row': 4, 'col': 7}]`.
+- One action usually returns one frame, but a single action can result in a short multi-frame animation; `current_frame` is always the final frame of that animation. When present, `last_action_result['animation']['worth_inspecting']` means the hidden frames are worth reading, and `['board_unchanged']` means the action's only visible effect -- a rejected click, a consumed attempt, a bounce off a wall -- lives in those hidden frames, not a no-op; no `animation` key means nothing was hidden. Call `animation()` for the diff timeline in either case.
+- `animation()` costs no in-game action and no action budget.
+- After `action(actions)` returns, `current_frame`, `previous_frame`, `history`, `transitions`, `valid_actions`, and `last_action_result` are refreshed.
+Multimodal context:
+- User turns include an attached image of the current ARC grid.
+- The image and `current_frame.ascii` are two representations of the same current frame.
+- You can use images and other tools to understand the game state and guide your strategy, each may be useful depending on the current uncertainty.
+Visual-game guidance:
+- Treat each board as a scene with objects, blockers, targets, adjacency, containment, motion, and symmetry.
+- Game entities are usually be rendered as connected multi-tile shapes such as 2×2, 2×3, 3×3, or longer patterned structures. Sometime they might also be 1x1 tokens.- Some games are logic or layout puzzles with no explicit player avatar or controllable sprite on the board. Do not assume a player exists; the relevant state may be an object, region, cursor, selector, or whole-board configuration.
+- Background colors are often white or gray/black-ish large regions, but not always. Verify background hypotheses by area, stability, and object boundaries rather than assuming them.
+- In many games, a long horizontal or vertical line near an edge is a timer or remaining-steps bar. It often shrinks or changes each step. If you identify such a bar, do not get distracted by it or treat it as core gameplay state unless there is concrete evidence that it interacts with the puzzle mechanics.
+A common failure mode is to mistake a segmented edge bar for clickable puzzle pieces. If a repeated strip of small blocks sits flush against the top, bottom, left, or right border and actions only change that strip while the interior board stays the same, classify it as HUD/timer state, not as an object to click through segment by segment. DON'T DO THIS!
+- Use coordinates only to target actions or describe local evidence. Do not frame the objective as reaching a specific absolute row or column.
+- Re-ground on the newest frame after any score increase or abrupt scene change; the returned board may already be the next level.
+- `WIN` means the whole game is solved. Mid-run level completion is more likely to appear as a score increase while play continues.
+- Strategies may transfer loosely across levels, but layouts and mechanics can change. Re-check the new board before repeating a plan.
+- For `MOUSE`, pass `row` and `col` integer arguments. `row` is vertical position, `col` is horizontal position.
+Python tool guidance:
+- Use `current_frame.segmentation` as your primary view of the board -- objects, colors, containment, adjacency, and cross-frame object hashes.
+- Use `current_frame.ascii` only to read a small, specific region of the board when `segmentation` is not enough; never use it to scan or summarize the whole board.
+- Every `python` tool call starts fresh. Re-import modules or re-define any custom utility logic you need.
+- The only importable standard-library modules are: bisect, collections, copy, fractions, functools, heapq, itertools, json, math, operator, random, re, statistics, string.
+- The only tool is `python`; call it with one ephemeral `code` string.
+- Always inspect `current_frame`, `history`, and `valid_actions` from Python instead of reasoning from the raw board by eye.
+- For the most recent change, compare `previous_frame` to `current_frame`, or `last_transition.before_frame` to `last_transition.after_frame`. `history[-1].frame` is the current frame, so comparing it to `current_frame` only compares the board to itself.
+- Maintain a compact working world model: what entities or regions exist, what actions seem to do, what the goal likely is, what remains uncertain, and what plan best fits the evidence so far.
+- IMPORTANT: Especially when the game is about making an agent navigate to a target, it is usually safer to write an explicit search algorithm such as BFS. More generally, when the objective is understood but the best action order is unclear, pathfinding, flood fill, BFS, DFS, beam search, shortest-path search, limited action-sequence search, or custom heuristics are all valid.
+- Optimize for the shortest reliable sequence that advances the current goal as described by your world model. If confidence is low, program a discriminating probe and revise the world model from the result.
+- Once the important state variables and action effects are sufficiently understood, stop probing and search in the inferred state space.
+- Inspect current and history frames from Python instead of describing frames freehand.
+- Never print or echo full board frames. Return only compact derived summaries such as object lists, diffs, coordinates, counts, or tiny local crops.
+- Keep tool-output context size minimal and decision-oriented so you can quickly compare before/after state. It's fine to write a lot of python code, just make the output short and interpretable
+- A strong default loop is: summarize the board, infer the desired environment change, write a small scorer or search over candidate sequences, execute the best probe or plan with `action(...)`, then inspect again until you understand exactly what changed.
+- For object tracking, match objects by color, overlap, bounding box proximity, area change, and edge contact rather than by exact coordinates alone.
+- For frame diffs, summarize changed cells, color transitions, appearing/disappearing components, movement candidates, and small local row slices around the changed region.
+- After every action, verify whether gameplay objects changed or whether only a timer, progress bar, or remaining-step bar moved. Do not treat HUD-only changes as evidence that the move worked.
+- Use `print(...)` for compact summaries, or assign a final compact object to `result`.
+- Call `action(...)` inside Python rather than returning action text in the chat.
+- `action(...)` accepts an ordered list of one or more actions. Once your code has selected a reliable sequence, it is often useful to batch it.
+- You can also call `action(...)` multiple times in one Python snippet, including inside loops. Each call updates the preloaded variables before execution continues.
+- If an action result reports `game_over`, `run_complete`, `level_completed`, or `done`, stop acting immediately and re-ground on the next turn.
+Tool session rules:
+- You have exactly one tool: `python`.
+- When calling `python`, emit exactly the tool-call format shown elsewhere in this prompt for this model. Use only that format; do not add markdown fences, prose wrappers, or alternate tool-call syntax. Do not quote or place tool-call markup inside explanatory text; when you decide to call the tool, emit the tool call itself.
+- The `python` tool code is not saved between calls, so rewrite any custom utility logic you still need.
+- You can call the `python` tool as many times as you want per step. Investigate until your code has a clear probe or plan.
+- Do not ration tool calls when the state is unclear. Spend extra tool calls to confirm what changed between frames and whether the last action affected gameplay state or only HUD elements such as countdown bars.
+- After `action(...)` returns, the structured runtime state is refreshed before the next Python statement and before the next tool call. Inspection-only Python calls do not clear `last_action_result`.
+- Each `python` tool call has a hard time limit of 30 seconds.
+- Tool responses are capped to about 1024 tokens. If a response is cut off, the tool result will tell you that.
+- Keep code snippets short and purpose-built rather than dumping large frameworks into one call.
+
+[USER]
+The code executed 7 actions in the previous sequence.
+Executed actions: DOWN, DOWN, DOWN, DOWN, DOWN, RIGHT, RIGHT.
+You are still on the same level.
+Current state: step 24, level 1.
+Valid actions right now: UP, DOWN, LEFT, RIGHT, SPACE.
+Only tool: `python`. It receives `current_frame`, `previous_frame`, `history`, `transitions`, `last_transition`, `valid_actions`, `last_action_result`, and `action(actions)`.
+Only letter-coded board views and lightweight metadata are exposed; raw numeric color IDs are not available.
+Keep tool output compact: use `current_frame.segmentation` as the primary view, and `current_frame.ascii` only for a small specific region; never print full boards.
+For the most recent change, compare `previous_frame` to `current_frame`, or `last_transition.before_frame` to `last_transition.after_frame`; `history[-1].frame` is the current frame, not the previous one.
+Use Python to inspect the evidence, refine that world model from the newest history, and search or score candidate actions or short sequences against the current goal as you currently understand it.
+Maintain a compact working world model of what the current level seems to contain, what actions appear to do, what the goal seems to be, what is still uncertain, and what plan currently looks best.
+Below you are provided with the current world model from the previous turn. The default behavior is to copy it and add or remove things based on the evidence that you gathered. BEFORE EXECUTING NEW ACTIONS YOU MUST ALWAYS GIVE THE REVISED VERSION OF THE WORLD MODEL.
+You may call `action(actions)` more than once in one Python snippet if your search or control loop needs it, but stop immediately if a result reports `game_over`, `run_complete`, `level_completed`, or `done`.
+Working world model carried from earlier turns:
+- Plan: Execute LEFT + 5×DOWN first, verify the red crossing worked, then do 5×RIGHT.
+- Revise any item above immediately if `current_frame` or `history` contradicts it.
+end of world model. 
+Focus on what changed most recently in `history`, update the target environment change if needed, and separate gameplay-object changes from HUD-only changes.
+When ready, call `action(actions)` from inside the `python` tool with the best valid action or ordered batch selected by your code. If your code has found a reliable short sequence, prefer batching it in one call.
+You may call `action(actions)` more than once in one Python snippet if your search or control loop needs it.
+If you include assistant text before a tool call, keep it short and use it to update the world model. Helpful optional prefixes are `World model:`, `Goal model:`, `Action model:`, `Recent findings:`, `Open questions:`, `Plan:`, and `Cross-level notes:`.
+When calling `python`, emit exactly the tool-call format shown elsewhere in this prompt for this model. Use only that format; do not add markdown fences, prose wrappers, or alternate tool-call syntax. Do not quote or place tool-call markup inside explanatory text; when you decide to call the tool, emit the tool call itself.
+Current grid image:
+
+[ASSISTANT]
+The player stopped at (32,14) — the 5th DOWN (crossing the red horizontal bar) was **blocked**, so red is a wall, not walkable. Also only 7 of my 12 requested actions executed (DOWN×5, RIGHT×2), so there may be a per-turn action cap. This means the level needs a different mechanism to cross the red. Let me investigate: (1) the red object's exact geometry, (2) whether the red moves/toggles across history, and (3) why the batch was cut short.
+[REASONING]
+The player stopped at (32,14), not (50,14). In other words, the 5th DOWN (the one that crosses the red horizontal bar) was blocked. So red is a wall (at least the horizontal bar blocks the player). My "red is walkable" hypothesis was wrong at the player-grid level.
+Wait, but the BFS with red walkable said the goal was reachable. But in reality, the player couldn't cross the red. So the red horizontal bar is a wall.
+But then, how is this level solvable? Let me rethink.
+The player is at (32,14). The red horizontal bar is at rows 38-41, columns 14-40, blocking the DOWN from (32,14). The red vertical bar is at columns 39-41, rows 9-41, blocking the RIGHT from (8,32).
+So the upper-left region is sealed off by the red L-shape. The goal is beyond the red.
+Wait, but the batch I executed was DOWN×7 + RIGHT×5 = 12 actions, but the system says "the code executed 7 actions in the previous sequence: DOWN, DOWN, DOWN, DOWN, DOWN, RIGHT, RIGHT". So only 7 actions were executed, not 12! And the player is at (32,14).
+Wait, let me re-read. "The code executed 7 actions in the previous sequence. Actions executed: DOWN, DOWN, DOWN, DOWN, DOWN, RIGHT, RIGHT."
+Hmm, so my batch of 12 actions was truncated to 7? Or did the environment stop after 7? Let me think. My sequence was ['DOWN']*7+['RIGHT']*5 = 12 actions. But only 7 were executed: DOWN×5, RIGHT×2.
+Wait, that's weird. Why only 7? Let me check: DOWN×5 from (8,14): (8,14)→(14,14)→(20,14)→(26,14)→(32,14)→(38,14)? No wait, the 5th DOWN should be (32,14)→(38,14), which crosses the red. If that's blocked, the player stays at (32,14). Then the 6th and 7th DOWNs (if executed) would also be blocked. But the executed sequence is DOWN×5, RIGHT×2, not DOWN×7.
+So it seems the environment executed only 7 out of my 12 actions. Why? Maybe there's a per-turn action budget, and it got cut off at 7? Or maybe the environment stops executing when... hmm.
+Actually wait. Let me reconsider. Maybe the environment has a limit on the number of actions per turn/sequence. My previous turn executed 5 actions (RIGHT, RIGHT, DOWN, DOWN, SPACE). This turn I requested 12, but only 7 were executed. Hmm, inconsistent.
+Or, maybe the 5th DOWN was blocked (player stayed at (32,14)), and then the RIGHT moves: RIGHT from (32,14) is blocked (white at columns 20-24). So RIGHT×2 should be no-ops. But the player is at (32,14), which is consistent with: DOWN×4 (reaching (32,14)), DOWN×1 blocked (stays at (32,14)), RIGHT×2 blocked (stays at (32,14)). That's 7 actions total (DOWN×5 + RIGHT×2), with the player ending at (32,14).
+So the environment executed 7 actions (DOWN×5, RIGHT×2), and stopped before the remaining 5 (DOWN×2, RIGHT×3). Why did it stop at 7?
+Hmm, maybe there's an action budget. Or maybe the environment only executes a limited number of actions per call. Let me check the last_action_result to understand.
+Actually, the important findings are:
+1. The player is now at (32,14).
+2. The 5th DOWN (crossing the red horizontal bar) was blocked → red is a wall.
+3. Only 7 of my 12 requested actions were executed.
+So red is a wall. The level requires a different mechanism to cross the red.
+Let me rethink the game. What can cross the red?
+- SPACE resets the player. Doesn't cross the red.
+- Maybe the red is a "laser" that toggles on/off over time, and I need to time the crossing. But I didn't see the red animate.
+- Maybe I need to "collect" something to disable the red.
+- Maybe the red is a "key" that opens a door.
+Wait, let me reconsider. Let me look at the red shape again. It's an L-shape: a vertical bar (columns ~40, rows 9-41) and a horizontal bar (rows ~38, columns 14-40).
+Hmm, actually, maybe the red isn't a wall at all, and the reason the player was blocked is something else. Let me re-verify: the player moved DOWN from (26,14) to (32,14) (the 4th DOWN, OK). Then the 5th DOWN from (32,14) to (38,14) was blocked. The swept region for this move is rows 32-42, columns 14-18. What's in there? The red horizontal bar is at rows 38-41, columns 14-40. So rows 38-41, columns 14-18 are red. So the red is blocking.
+But wait, in the BFS with red walkable, this move was OK. So the only difference is the red. So the red is blocking the player. So red is a wall (at least for the player).
+So how do I cross the red? Let me rethink.
+Maybe the red is a "laser gate" that I need to turn off. How? Maybe by pressing SPACE at a specific position? Or maybe the red toggles based on some condition?
+Or, maybe I'm misreading the maze, and there's another path that doesn't go through the red. Let me re-examine the maze structure.
+Wait, the BFS with red=wall found only 11 reachable nodes (upper-left region). The goal isn't reachable. So if the red is a permanent wall, the level is unsolvable. So the red must be passable under some condition.
+Let me rethink. Let me look at the red more carefully. Maybe the red is a "moving" barrier, or maybe it's a "laser" that has gaps.
+Actually, let me reconsider the whole game. Let me look at the image again. The red L-shape... actually, maybe the red is a "snake" or "laser" that moves, and I need to time it.
+Or, maybe the red is a "wall" but there's a "door" somewhere that I need to open.
+Hmm, let me reconsider. Let me look at the red's pixel count and position across the entire history to check if it's moving or toggling.
+Actually, let me step back and think about the game design. This is a grid puzzle. The player moves in 6px steps. There's a red L-shaped barrier. The goal is beyond the barrier.
+Wait—maybe the red barrier is a "laser" that the player can cross by "jumping" (SPACE)? But SPACE resets the player to the start position. That doesn't help.
+Or, maybe SPACE isn't a reset. Let me re-verify. In the history:
+- Transition 15: SPACE at (20,26) → (8,14).
+- And this turn, the player was at (8,14) before the batch (after the previous turn's SPACE).
+So SPACE moves the player to (8,14). That's a reset/teleport to the start position.
+Hmm wait, but maybe SPACE is a "jump" that makes the player leap over the next wall? Let me reconsider. When the player pressed SPACE at (20,26), they went to (8,14). That's a big jump (from (20,26) to (8,14)). That's not a "jump over the next wall"—that's a teleport to the start position.
+So SPACE = teleport to start position. Confirmed.
+Then how do I cross the red?
+Let me rethink. Maybe the red isn't a wall, and the reason the player was blocked is that the player needs to be in a specific state.
+Actually, wait. Let me reconsider the possibility that the red is a "laser" that toggles. Let me check the red across frames. Let me look at the red's pixel count in the history.
+Actually, let me reconsider the action budget issue first. Why were only 7 of my 12 actions executed? Let me check last_action_result and the transitions.
+Let me investigate:
+1. The red's pixel count/position across the history (is it moving/toggling?).
+2. Why only 7 actions were executed.
+3. The current player position and surroundings.
+Let me write the code.
+Actually, the key insight I'm missing: how to cross the red. Let me look at the red more carefully. Let me get the exact boundaries of the red object.
+Let me investigate the segmentation for the red object.
+[ASSISTANT TOOL CALL: python]
+id: chatcmpl-tool-b5c4d32cc09b6bbd
+<tool_call>
+<function=python>
+<parameter=code>
+# 1) red objects in current frame
+reds=[n for n in current_frame.segmentation['nodes'] if n['color']=='R']
+for n in reds:
+    px=n['boundary']; rs=[p[0] for p in px]; cs=[p[1] for p in px]
+    print("RED id",n['id'],"pixels",n['pixels'],"rows",min(rs),max(rs),"cols",min(cs),max(cs),"hash",n['hash'][:8])
+# 2) red pixel total across history frames
+print("--- red pixels per frame ---")
+for i,h in enumerate(history):
+    tot=sum(n['pixels'] for n in h.frame.segmentation['nodes'] if n['color']=='R')
+    print(i, h.action, "redPx", tot)
+# 3) why batch cut: last transitions
+print("--- last 8 transitions ---")
+for t in transitions[-8:]:
+    print(t.action, "changed=",t.result.get('board_changed'))
+</parameter>
+</function>
+</tool_call>
+
+[TOOL RESULT: chatcmpl-tool-b5c4d32cc09b6bbd]
+RED id 6 pixels 82 rows 9 42 cols 14 41 hash 86fa7eae
+--- red pixels per frame ---
+0  redPx 82
+1 DOWN redPx 82
+2 DOWN redPx 82
+3 RIGHT redPx 82
+4 DOWN redPx 82
+5 LEFT redPx 82
+6 DOWN redPx 82
+7 DOWN redPx 82
+8 DOWN redPx 82
+9 DOWN redPx 82
+10 SPACE redPx 82
+11 SPACE redPx 82
+12 RIGHT redPx 82
+13 RIGHT redPx 82
+14 DOWN redPx 82
+15 DOWN redPx 82
+16 SPACE redPx 82
+17 DOWN redPx 82
+18 DOWN redPx 82
+19 DOWN redPx 82
+20 DOWN redPx 82
+21 DOWN redPx 82
+22 RIGHT redPx 82
+23 RIGHT redPx 82
+--- last 8 transitions ---
+SPACE changed= None
+DOWN changed= None
+DOWN changed= None
+DOWN changed= None
+DOWN changed= None
+DOWN changed= None
+RIGHT changed= None
+RIGHT changed= True
+
+[USER]
+The code executed 7 actions in the previous sequence.
+Executed actions: DOWN, DOWN, DOWN, DOWN, DOWN, RIGHT, RIGHT.
+You are still on the same level.
+Current state: step 24, level 1.
+Valid actions right now: UP, DOWN, LEFT, RIGHT, SPACE.
+Only tool: `python`. It receives `current_frame`, `previous_frame`, `history`, `transitions`, `last_transition`, `valid_actions`, `last_action_result`, and `action(actions)`.
+Only letter-coded board views and lightweight metadata are exposed; raw numeric color IDs are not available.
+Keep tool output compact: use `current_frame.segmentation` as the primary view, and `current_frame.ascii` only for a small specific region; never print full boards.
+For the most recent change, compare `previous_frame` to `current_frame`, or `last_transition.before_frame` to `last_transition.after_frame`; `history[-1].frame` is the current frame, not the previous one.
+Use Python to inspect the evidence, refine that world model from the newest history, and search or score candidate actions or short sequences against the current goal as you currently understand it.
+Maintain a compact working world model of what the current level seems to contain, what actions appear to do, what the goal seems to be, what is still uncertain, and what plan currently looks best.
+Below you are provided with the current world model from the previous turn. The default behavior is to copy it and add or remove things based on the evidence that you gathered. BEFORE EXECUTING NEW ACTIONS YOU MUST ALWAYS GIVE THE REVISED VERSION OF THE WORLD MODEL.
+You may call `action(actions)` more than once in one Python snippet if your search or control loop needs it, but stop immediately if a result reports `game_over`, `run_complete`, `level_completed`, or `done`.
+Working world model carried from earlier turns:
+- Plan: Execute LEFT + 5×DOWN first, verify the red crossing worked, then do 5×RIGHT.
+- Revise any item above immediately if `current_frame` or `history` contradicts it.
+end of world model. 
+Focus on what changed most recently in `history`, update the target environment change if needed, and separate gameplay-object changes from HUD-only changes.
+When ready, call `action(actions)` from inside the `python` tool with the best valid action or ordered batch selected by your code. If your code has found a reliable short sequence, prefer batching it in one call.
+You may call `action(actions)` more than once in one Python snippet if your search or control loop needs it.
+If you include assistant text before a tool call, keep it short and use it to update the world model. Helpful optional prefixes are `World model:`, `Goal model:`, `Action model:`, `Recent findings:`, `Open questions:`, `Plan:`, and `Cross-level notes:`.
+When calling `python`, emit exactly the tool-call format shown elsewhere in this prompt for this model. Use only that format; do not add markdown fences, prose wrappers, or alternate tool-call syntax. Do not quote or place tool-call markup inside explanatory text; when you decide to call the tool, emit the tool call itself.
+Current grid image:
+
+[ASSISTANT]
+Critical findings: the red is a **single static L-shaped wall** (rows 9-42, cols 14-41, 82 px, unchanged every frame), and it's blocking the player — so red is a wall, not walkable. My earlier "red walkable" conclusion was wrong; the player got stuck at (32,14). Also the batch was cut at 7 actions (likely a per-call cap or no-op stop).
+This means I'm misreading the maze — the level must be solvable. Let me re-map the maze precisely: exact red cells, and the actual corridor structure (which cells are black/walkable vs white/wall), to find the real path.
+[REASONING]
+Main findings:
+1. The red is a single object: rows 9-42, cols 14-41, 82 pixels. It's an L-shape (a vertical bar + horizontal bar merged into one object). It's static (82 pixels in every frame). So the red doesn't move or toggle.
+2. The red is a wall (the player can't cross it).
+3. Only 7 out of 12 actions were executed. Looking at the transitions: SPACE, DOWN×5, RIGHT×2. Wait, the last 8 transitions are: SPACE, DOWN, DOWN, DOWN, DOWN, DOWN, RIGHT, RIGHT. So after SPACE (transition 16), there were DOWN×5 (17-21) and RIGHT×2 (22-23). That's my batch of 12 (DOWN×7 + RIGHT×5), but only DOWN×5 + RIGHT×2 = 7 were executed. So the environment cut off my batch at 7 actions.
+Wait, why 7? Let me think. Maybe there's a per-turn action budget. The previous turn executed 5 actions. This turn executed 7. Hmm. Maybe the budget is variable, or maybe the environment stops when the player gets blocked?
+No wait. Let me reconsider. Let me look at the board_changed flags: SPACE(None), DOWN(None)×5, RIGHT(None), RIGHT(True). The last RIGHT had board_changed=True. Interesting. So the 2nd RIGHT changed the board. But the player is at (32,14)...
+Wait, let me reconsider. Let me re-trace. The player was at (8,14) before the batch. The batch is DOWN×7 + RIGHT×5.
+- DOWN 1: (8,14)→(14,14)
+- DOWN 2: (14,14)→(20,14)
+- DOWN 3: (20,14)→(26,14)
+- DOWN 4: (26,14)→(32,14)
+- DOWN 5: (32,14)→? blocked by red → stays at (32,14)
+- DOWN 6: blocked → stays at (32,14)
+- DOWN 7: blocked → stays at (32,14)
+- RIGHT 1: (32,14)→? blocked by white → stays at (32,14)
+- RIGHT 2: blocked → stays at (32,14)
+...
+But only 7 actions were executed (DOWN×5, RIGHT×2). So the environment stopped after 7. Why?
+Hmm, maybe the environment has a per-call action limit of about 7? Or maybe it stops when N consecutive no-ops occur? Let me see: DOWN 5, 6, 7 are no-ops (blocked), RIGHT 1, 2 are no-ops. So after DOWN 5 (the first blocked one), there were 4 more no-ops (DOWN 6, 7, RIGHT 1, 2)... no wait, only DOWN 5, RIGHT 1, RIGHT 2 were executed after DOWN 4.
+Actually, let me recount the executed actions: DOWN, DOWN, DOWN, DOWN, DOWN, RIGHT, RIGHT = 5 DOWNs + 2 RIGHTs. So:
+- DOWN 1-4: move the player (8,14)→(32,14).
+- DOWN 5: blocked (red), stays at (32,14).
+- RIGHT 1: blocked (white), stays at (32,14).
+- RIGHT 2: blocked (white), stays at (32,14).
+Then the environment stopped (didn't execute the remaining DOWN×2 + RIGHT×3).
+So the environment cut off the batch. Why? Maybe there's a limit on the number of actions per call. Or maybe it stops after a certain number of no-ops.
+Actually, the last RIGHT had board_changed=True. That's strange if the player didn't move. Let me reconsider—maybe the board_changed=True is about the HUD (the timer bar at the bottom). The blue bar at the bottom (timer/progress) might be shrinking. So board_changed=True might just be the timer moving.
+In any case, the important findings:
+1. The red is a static wall (L-shape, rows 9-42, cols 14-41).
+2. The player can't cross the red.
+3. The batch was cut off at 7 actions (there might be a per-call limit, or it might stop on no-ops).
+Now, the big question: how do I cross the red to reach the goal?
+Let me reconsider the game. The red is a static L-shaped wall. The player is trapped in the upper-left region. The goal is beyond the red.
+Wait, maybe I'm misunderstanding the maze. Let me reconsider. Maybe the red isn't a wall blocking the player's path, and the actual path to the goal doesn't go through the red. Let me re-examine the maze structure.
+No wait. Let me reconsider the maze. Let me look at the black corridors and white walls more carefully. Maybe there's a path that goes around the red.
+The red L-shape: vertical bar (cols ~39-41, rows 9-42) and horizontal bar (rows ~38-41, cols 14-41). So the red forms an L that encloses the upper-left region on the right (vertical bar) and bottom (horizontal bar).
+Hmm, but wait. Let me reconsider. The red object spans rows 9-42, cols 14-41. But it's only 82 pixels, so it's a thin L (a 3px-wide line), not a filled region. So the red is a thin L-shaped line.
+So the maze is: a black "C" corridor, with a thin red L-line inside. The player walks on the black. The red L-line is a wall.
+Let me reconsider the corridors. Let me re-examine where the black corridors are and where the white walls are, and find a path from the player to the goal that avoids the red.
+Actually, my BFS (red=wall) found only 11 reachable nodes, all in the upper-left. So there's no path avoiding the red. So the red is blocking the only path.
+Wait, that can't be right for a solvable game. Let me reconsider.
+Oh! Maybe I have the maze wrong. Maybe the black isn't all walkable, and the white is walkable. Let me reconsider.
+Wait, the player is on the black (the player at (8,14) is on the black). And the player moves on the black. So the black is walkable. And the white is walls.
+But wait, let me reconsider. Let me look at the image again. The maze is a "C" shape (like a "C" or "E"). The black is the thick frame of the C, and the white is the interior (the "mouth" of the C). The player is on the black frame.
+Hmm, so the player walks along the black frame of the C. The goal is at the lower right, on the black frame.
+But the red L is inside, blocking part of the frame.
+Wait, let me reconsider. Let me look at the actual corridors. Let me re-examine the maze structure with a fresh eye. Let me map out the black regions.
+Actually, let me reconsider the possibility that the white is walkable and the black is walls. No, the player is clearly on the black.
+Let me reconsider. Let me look at the maze as a whole. Let me identify the corridors (the walkable black paths).
+Actually, I think the issue is this: the black "C" frame is the walkable path, but it's a thick frame (multiple cells wide). The player moves within this frame. The white interior is walls. The red L is a wall inside the frame.
+Let me re-examine: the frame of the C. The C has:
+- A top bar (rows ~8-12, cols 14-40).
+- A left bar (cols ~14-18, rows 8-50).
+- A bottom bar (rows ~44-50, cols 14-44).
+- The right side is open (the mouth of the C), except for the upper-right and lower-right ends.
+Wait, but the image shows the C as a closed shape. Let me look again. The image shows a "C" (or "E") shape. Actually it looks like a "C" with the right side partially closed by the red.
+Hmm, I'm getting confused. Let me carefully re-map the maze. Let me identify all the black regions and their connectivity, and find the corridors.
+Actually, let me step back. The BFS (red=wall, black+blue=floor) found 11 reachable nodes in the upper-left. This means that with the red as a wall, the player can only move in the upper-left. So the red is blocking the path to the goal.
+But the game must be solvable. So either:
+(a) The red is passable under some condition (but it's static, so no), or
+(b) There's a path I'm missing (my floor model is wrong), or
+(c) The goal is reachable by some other means.
+Let me reconsider (b). Maybe my floor model (black+blue=floor) is wrong. Let me reconsider what's walkable.
+Wait, actually—maybe the white is walkable and the black is walls! Let me reconsider. If the white is walkable:
+- The player is at (8,14), which is... let me check. Is (8,14) on the black or the white? From the image, the player (blue) is in the upper-left, on the black frame. So (8,14) is on the black. If the black is walls, the player would be on a wall, which doesn't make sense.
+So the black is walkable. OK.
+Let me reconsider. Let me re-examine the maze structure very carefully. Let me map out the black corridors and see if there's a path from the upper-left to the lower-right (goal) that goes around the red.
+Actually, wait. Let me reconsider the red's position. The red L: vertical bar at cols 39-41 (rows 9-42), horizontal bar at rows 38-41 (cols 14-41). So the red L's corner is at (rows 38-42, cols 39-41).
+The upper-left region (where the player is) is bounded on the right by the red vertical bar (cols 39-41) and on the bottom by the red horizontal bar (rows 38-41).
+To get to the goal (lower-right, rows 49-55, cols 43-49), the player needs to get past the red.
+Now, the black corridors: let me think about where the black is. The C-shape:
+- The top bar of the C: rows 8-12, cols 14-40 (black). The player is here.
+- The left bar: cols 14-18, rows 8-50 (black).
+- The bottom bar: rows 44-50, cols 14-44 (black). The goal is at the right end.
+- The upper-right end: cols 39-41, rows 8-12 (black)—this is where the red vertical bar starts.
+- The lower-right end: cols 43-49, rows 44-55 (black)—this is where the goal is.
+Wait, so the C is actually closed on the right? Let me look at the image again. The image shows a "C" shape, but actually it looks like the right side is closed at the top (upper-right corner) and the bottom (lower-right corner, where the goal is), with the middle-right open (the mouth of the C).
+Hmm, actually the shape in the image looks like a "C" or "G" or "E". Let me look very carefully.
+From the image:
+- Upper-left: the player (blue) is in a black region.
+- The black forms a shape like a "C" or "E".
+- There's a white rectangular hole in the upper-middle (rows ~14-20, cols ~20-28).
+- The red L is on the right side.
+- The goal (blue) is at the lower-right.
+Let me reconsider. Actually, I think the shape is a "C" (opening to the right), and the red L is placed in the mouth of the C, blocking it.
+Wait, but if the C opens to the right, then the player can go around the right side... no, the red blocks it.
+I'm going in circles. Let me carefully re-map the maze with code. Let me identify the black regions (corridors) and the white regions (walls), and check the connectivity.
+Actually, let me reconsider the whole thing from a different angle. Let me reconsider: maybe the player doesn't need to cross the red. Maybe the goal is reachable without crossing the red, and my BFS was wrong because my floor model was too restrictive (I required the entire 11x5 sweep region to be floor, but maybe the player can move even if part of the sweep region is a wall, as long as the destination cell is floor).
+Wait, that's an important point! My swept_ok requires the entire swept region (11x5) to be floor. But maybe the actual rule is different. Let me reconsider.
+When the player moves RIGHT from (8,14) to (8,20), the player's body sweeps across cols 14-24 (11 cols) in rows 8-12 (5 rows). For the move to be valid, all these cells must be floor (the player can't pass through walls). So the swept region must be floor. That's what I modeled.
+But wait, maybe the player's body is smaller than 5x5, or the sweep is different. Let me reconsider the player's size. The player is a 5x5 blue square (25 pixels). When it moves 6px to the right, the swept region is 11 wide (5+6) × 5 tall. So the swept region is 11x5. That's what I modeled.
+Hmm, but let me reconsider. Actually, maybe the move is valid as long as the destination position (the player's new 5x5 footprint) is all floor, and the player "slides" through (the swept region doesn't need to be all floor). But that would allow the player to pass through thin walls, which is weird.
+Actually, for a sliding puzzle, the swept region must be clear. So my model should be correct.
+Let me reconsider. Let me re-examine the 11 reachable nodes and see if there's a path I'm missing.
+Actually, let me reconsider the maze from scratch. Let me carefully map the black and white regions and find all the corridors. Let me use code to identify the large black regions and their shapes.
+Let me reconsider: maybe the maze has a path that goes through the white (i.e., the white is walkable in some places). No, the white is walls.
+OK, let me just carefully re-map the maze. Let me identify the black corridors.
+Actually, I realize I should reconsider whether the red is really blocking, or whether the player just couldn't move for a different reason. Let me re-examine: the player was at (32,14) and tried to move DOWN to (38,14). The swept region is rows 32-42, cols 14-18. The red horizontal bar is at rows 38-41, cols 14-41. So rows 38-41, cols 14-18 are red. So the red is in the swept region. So the red is blocking.
+But wait—maybe the red horizontal bar isn't at cols 14-18. Let me check the exact position of the red. The red object spans rows 9-42, cols 14-41. But it's a thin L (82 pixels). Let me get the exact cells of the red.
+Let me reconsider. The red L: let me figure out the exact cells. 82 pixels. A vertical bar of width 3 (cols 39-41) and height ~34 (rows 9-42) = 3×34 = 102. That's more than 82. So the vertical bar isn't 3 wide throughout. Let me get the exact red cells.
+Let me use code to extract the exact red cells from the ascii.
+Actually, let me reconsider the whole approach. Let me carefully re-map the maze:
+1. Extract the exact red cells.
+2. Extract the black corridors (walkable regions).
+3. Find a path from the player to the goal.
+Let me do this.
+Actually, the most important thing is: let me reconsider whether there's a path that avoids the red. Let me re-run the BFS, but this time let me visualize the reachable region and the maze structure to understand why the goal is unreachable.
+Let me map the maze as a coarse grid (each cell = 6px) and see the corridors.
+Let me write code to:
+1. Get the exact red cells.
+2. Map the maze on a 6px grid (is each 6x6 block floor or wall?).
+3. Find a path.
+Actually, the player moves in 6px steps, so the natural grid is 6px cells. But the player is 5x5 and the corridors are ~5px wide (1 cell). Hmm, this is getting complicated.
+Let me simplify: let me just look at the maze structure by examining specific rows and columns to understand the corridors.
+Let me reconsider. Let me look at the maze as a "C" shape:
+- The player is in the upper-left.
+- The goal is in the lower-right.
+- The red L blocks the direct path.
+For the game to be solvable, there must be a way around the red. Let me look for a gap in the red or a path around it.
+The red L: vertical bar (right side) + horizontal bar (middle). The corner is at the lower-right of the L. So the red L encloses the upper-left region. To get out, the player must cross the red.
+Unless... the red L doesn't fully enclose. Let me check: does the red vertical bar extend all the way to the top (row 9) and connect to the top wall? And does the red horizontal bar extend all the way to the left (col 14) and connect to the left wall? If so, the upper-left region is fully enclosed.
+From the red's bounding box (rows 9-42, cols 14-41): the vertical bar is at cols ~39-41, from row 9 to row 42. The horizontal bar is at rows ~38-41, from col 14 to col 41. So:
+- The vertical bar's top is at row 9. Is row 9 connected to the top wall (row 8)? The top bar of the C is at rows 8-12. So the red vertical bar (starting at row 9) is inside the top bar. Hmm.
+- The horizontal bar's left is at col 14. The left bar of the C is at cols 14-18. So the red horizontal bar (starting at col 14) touches the left wall.
+So the red L: the horizontal bar goes from the left wall (col 14) to the right (col 41), and the vertical bar goes from the top (row 9) to the bottom (row 42). They meet at the corner (rows 38-42, cols 39-41).
+So the red L encloses the upper-left region (above the horizontal bar and to the left of the vertical bar). The upper-left region is bounded by:
+- Top: the top wall (rows 0-8).
+- Left: the left wall (cols 0-13).
+- Right: the red vertical bar (cols 39-41).
+- Bottom: the red horizontal bar (rows 38-41).
+So the player is trapped in the upper-left region. To get out, the player must cross the red.
+But the red is a static wall. So the player can't get out. So the game is unsolvable?? That can't be right.
+Let me reconsider. Maybe I'm misreading the maze. Let me look at the image very carefully again.
+Looking at the image:
+- The overall shape is a "C" (or "E").
+- Upper-left: the player (blue square) is in a black region.
+- There's a white rectangular hole in the upper-middle.
+- The red L is on the right: a vertical red bar going down from the upper-right, and a horizontal red bar going left from the middle-right.
+- The goal (blue square) is at the lower-right.
+Wait, actually, maybe the shape isn't a "C" but an "E" or a spiral. Let me reconsider.
+Actually, let me reconsider: maybe the black is the walls and the white is the walkable path! Let me reconsider this.
+If the white is walkable:
+- The player is at (8,14). Is (8,14) on the white or the black? From the image, the player is in the upper-left, and it looks like it's on the black (the black frame). But let me verify with code.
+Hmm, let me just check: what color is the cell at (8,14) (the player's position, excluding the player itself)? Actually, the player is there, so I can't tell. Let me check a nearby cell.
+Actually, let me reconsider by looking at where the player has moved. The player has moved to (8,20), (8,26), (14,26), (20,26), (14,14), (20,14), (26,14), (32,14). Let me check what color these positions are on (in a frame where the player isn't there).
+Let me check the first frame (history[0]) where the player is at (8,14). Let me check the cells at (8,20), (14,14), etc. in that frame.
+Actually, this is getting too complicated. Let me just carefully re-map the maze with code. Let me:
+1. Get the exact red cells.
+2. For a frame where the player is at the start position, map the colors of the cells the player has visited (to determine if they're black or white).
+3. Reconsider the walkable model.
+Let me do this.
+Actually, the simplest thing is: let me check the color of the cells in the player's path. In history[0] (player at (8,14)), let me check the cells at (8,20), (8,26), (14,26), (20,26), (14,14), (20,14), (26,14), (32,14). If they're all black, then the black is walkable. If they're white, then the white is walkable.
+Let me do that.
+Actually, I already know the player moved there, so those cells must be walkable. And my BFS (black=floor) found them reachable. So the black is walkable. OK.
+So the black is walkable, the white is walls, and the red is a wall. And the player is trapped in the upper-left.
+This means the game is unsolvable with the current understanding. So I must be misunderstanding something.
+Let me reconsider. Let me look at the image again, very carefully.
+Oh wait. Maybe the shape is a spiral, and the path goes around. Let me reconsider the maze structure.
+Let me re-examine: the black shape. Let me trace it.
+Actually, let me reconsider the possibility that the red is walkable but the player was blocked for a different reason. Let me re-examine the 5th DOWN. The player was at (32,14) and tried to move DOWN to (38,14).
+Wait, let me reconsider the player's position. The player is a 5x5 square. When I say the player is at (32,14), I mean the top-left is at (32,14), so the player occupies rows 32-36, cols 14-18. To move DOWN to (38,14), the player would occupy rows 38-42, cols 14-18. The swept region is rows 32-42, cols 14-18.
+Now, is the red in rows 38-42, cols 14-18? The red horizontal bar is at rows ~38-41, cols 14-41. So yes, rows 38-41, cols 14-18 are red. So the red is blocking.
+But wait, let me double-check the exact position of the red horizontal bar. Let me get the exact red cells.
+Let me reconsider: maybe the red horizontal bar isn't at cols 14-18. Maybe it starts further right. Let me check.
+Let me get the exact red cells from the ascii.
+Let me write code to extract the red cells and the maze structure.
+Let me do a thorough re-mapping.
+[ASSISTANT TOOL CALL: python]
+id: chatcmpl-tool-a289ed5ed91177e5
+<tool_call>
+<function=python>
+<parameter=code>
+g=[list(line) for line in current_frame.ascii.split('\n')]
+# exact red cells
+redcells=[(r,c) for r in range(64) for c in range(64) if g[r][c]=='R']
+rs=[r for r,c in redcells]; cs=[c for r,c in redcells]
+print("red bbox rows",min(rs),max(rs),"cols",min(cs),max(cs),"count",len(redcells))
+# vertical bar cols & horizontal bar rows
+from collections import Counter
+colc=Counter(c for r,c in redcells); rowc=Counter(r for r,c in redcells)
+print("red col histogram:",dict(sorted(colc.items())))
+print("red row histogram (top/bottom):", {r:rowc[r] for r in sorted(rowc)[:3]}, "...", {r:rowc[r] for r in sorted(rowc)[-3:]})
+# Map maze on 6px grid: for each 6x6 block starting at (8+6a,14+6b) is it all-black(floor)?
+print("--- 6px-block floor map (F=floor all-black, .=has white, R=has red) rows a=0..8, cols b=0..8 ---")
+for a in range(9):
+    row=""
+    for b in range(9):
+        r0=8+6*a; c0=14+6*b
+        cells=[g[r][c] for r in range(r0,r0+5) for c in range(c0,c0+5)]
+        if 'R' in cells: ch='R'
+        elif 'W' in cells or 'w' in cells: ch='.'
+        elif all(x=='B' for x in cells): ch='F'
+        else: ch='?'
+        row+=ch
+    print(row)
+</parameter>
+</function>
+</tool_call>
+
+[TOOL RESULT: chatcmpl-tool-a289ed5ed91177e5]
+red bbox rows 9 42 cols 14 41 count 82
+red col histogram: {14: 3, 15: 5, 16: 5, 17: 5, 18: 5, 19: 1, 20: 1, 21: 1, 22: 1, 23: 1, 24: 1, 25: 1, 26: 1, 27: 1, 28: 1, 29: 1, 30: 1, 31: 1, 32: 1, 33: 1, 34: 1, 35: 1, 36: 1, 37: 1, 38: 1, 39: 4, 40: 32, 41: 3}
+red row histogram (top/bottom): {9: 3, 10: 3, 11: 3} ... {40: 27, 41: 4, 42: 5}
+--- 6px-block floor map (F=floor all-black, .=has white, R=has red) rows a=0..8, cols b=0..8 ---
+
+error:
+Traceback (most recent call last):
+  File "<python_tool>", line 17, in <module>
+IndexError: list index out of range
+
+[USER]
+The code executed 7 actions in the previous sequence.
+Executed actions: DOWN, DOWN, DOWN, DOWN, DOWN, RIGHT, RIGHT.
+You are still on the same level.
+Current state: step 24, level 1.
+Valid actions right now: UP, DOWN, LEFT, RIGHT, SPACE.
+Only tool: `python`. It receives `current_frame`, `previous_frame`, `history`, `transitions`, `last_transition`, `valid_actions`, `last_action_result`, and `action(actions)`.
+Only letter-coded board views and lightweight metadata are exposed; raw numeric color IDs are not available.
+Keep tool output compact: use `current_frame.segmentation` as the primary view, and `current_frame.ascii` only for a small specific region; never print full boards.
+For the most recent change, compare `previous_frame` to `current_frame`, or `last_transition.before_frame` to `last_transition.after_frame`; `history[-1].frame` is the current frame, not the previous one.
+Use Python to inspect the evidence, refine that world model from the newest history, and search or score candidate actions or short sequences against the current goal as you currently understand it.
+Maintain a compact working world model of what the current level seems to contain, what actions appear to do, what the goal seems to be, what is still uncertain, and what plan currently looks best.
+Below you are provided with the current world model from the previous turn. The default behavior is to copy it and add or remove things based on the evidence that you gathered. BEFORE EXECUTING NEW ACTIONS YOU MUST ALWAYS GIVE THE REVISED VERSION OF THE WORLD MODEL.
+You may call `action(actions)` more than once in one Python snippet if your search or control loop needs it, but stop immediately if a result reports `game_over`, `run_complete`, `level_completed`, or `done`.
+Working world model carried from earlier turns:
+- Plan: Execute LEFT + 5×DOWN first, verify the red crossing worked, then do 5×RIGHT.
+- Revise any item above immediately if `current_frame` or `history` contradicts it.
+end of world model. 
+Focus on what changed most recently in `history`, update the target environment change if needed, and separate gameplay-object changes from HUD-only changes.
+When ready, call `action(actions)` from inside the `python` tool with the best valid action or ordered batch selected by your code. If your code has found a reliable short sequence, prefer batching it in one call.
+You may call `action(actions)` more than once in one Python snippet if your search or control loop needs it.
+If you include assistant text before a tool call, keep it short and use it to update the world model. Helpful optional prefixes are `World model:`, `Goal model:`, `Action model:`, `Recent findings:`, `Open questions:`, `Plan:`, and `Cross-level notes:`.
+When calling `python`, emit exactly the tool-call format shown elsewhere in this prompt for this model. Use only that format; do not add markdown fences, prose wrappers, or alternate tool-call syntax. Do not quote or place tool-call markup inside explanatory text; when you decide to call the tool, emit the tool call itself.
+Current grid image:
+
+[ASSISTANT]
+The block map crashed (col range exceeded 64), but the red histogram is very informative: the red is a **thin 1-px-wide L-line** — vertical line at col 40 (rows 9-40) + horizontal line at row 40 (cols 14-40), meeting at (40,40), with slightly thicker ends. So it's a thin wall, not a thick bar. I need to see the full maze structure to find the real path. Let me print a downsampled 16×16 map of the whole board.
+[REASONING]
+The code crashed with an IndexError on line 17 (the 6px block map). The problem: `g[r][c]` — the ascii rows might be shorter than 64, or the number of rows might be less than 64. Let me check the shape of the ascii. Actually, the red histogram was output without issue, so `g` is fine for the red cells. The IndexError is in the block map loop, at `g[r][c]` where r goes up to 8+6*8+5 = 61, c goes up to 14+6*8+5 = 67. c=67 exceeds 64! That's the bug. c0 = 14+6*b, and when b=8, c0=62, c0+5=67 > 64. So the columns of the block map are out of range.
+But I got some important info from the red histogram:
+- Red column histogram: {14:3, 15:5, 16:5, 17:5, 18:5, 19:1, 20:1, ..., 38:1, 39:4, 40:32, 41:3}
+- So the red is:
+  - Columns 14-18: 3-5 pixels each (this is the left end of the horizontal bar, rows ~38-41).
+  - Columns 19-38: 1 pixel each (this is the horizontal bar, 1 pixel tall, at row ~40).
+  - Column 39: 4 pixels.
+  - Column 40: 32 pixels (this is the vertical bar, 32 pixels tall).
+  - Column 41: 3 pixels.
+- Red row histogram: rows 9, 10, 11 have 3 pixels each (top of the vertical bar, columns 39-41). Rows 40, 41, 42: 27, 4, 5 pixels.
+So the structure of the red L:
+- Vertical bar: column 40 (32 pixels, rows ~9-40), plus columns 39 and 41 at the top (rows 9-11) and the bottom.
+- Horizontal bar: row 40 (27 pixels, columns 14-40), 1 pixel tall.
+- The corner is at (row 40, column 40).
+So the red L is thin: the vertical bar is 1 pixel wide (column 40) for most of its length, and the horizontal bar is 1 pixel tall (row 40). At the top (rows 9-11) and the left end (columns 14-18) it's a bit thicker (3-5 pixels).
+Wait, let me reconsider. Column 40 has 32 pixels. The vertical bar spans rows 9-40 (32 rows). So the vertical bar is at column 40, rows 9-40, 1 pixel wide. Plus columns 39 and 41 at rows 9-11 (top) and rows 40-42 (bottom corner).
+The horizontal bar is at row 40, columns 14-40 (27 pixels), 1 pixel tall. Plus rows 38-39 at columns 14-18 (left end, thicker).
+So the red L is essentially:
+- Vertical line: column 40, rows 9-40.
+- Horizontal line: row 40, columns 14-40.
+- They meet at (40,40).
+- The top of the vertical line (rows 9-11, columns 39-41) and the left end of the horizontal line (rows 38-41, columns 14-18) are slightly thicker (3 pixels).
+So the red is a thin L-shaped line (mostly 1 pixel wide/tall).
+Now, the player is 5x5. When the player moves, the swept region is 11x5 (or 5x11). For the player to cross the 1-pixel-wide red line, the swept region (11x5) would include the red line. So the red blocks the player.
+But wait — the red is only 1 pixel wide. The player is 5 pixels wide. So the player can't "squeeze through" the 1-pixel red line. The red is a wall.
+Hmm, so the red is a thin wall forming an L. The player is trapped in the upper left.
+Wait, but this changes my understanding of the maze! The red is a thin line, not a thick bar. Let me reconsider the maze structure.
+Actually, this makes me reconsider the whole maze. Let me reconsider what's a wall and what's a floor.
+Let me reconsider: the black "C" shape. The black is the frame. But actually, maybe the maze is different from what I thought.
+Let me reconsider. Let me look at the image again. The shape looks like a "C" or "E". The black is a thick frame. The white is the interior.
+But actually, wait. Let me reconsider the possibility that the white is the walkable path and the black is the wall. Let me look at the image again.
+In the image:
+- The player (blue) is in the upper left, on top of the black.
+- The goal (blue) is in the lower right, on top of the black.
+- The black forms a "C"/"E" shape.
+- The white is the interior (the "mouth" of the C and the hole in the upper middle).
+Hmm, if the black is the walkable frame, then the player walks along the frame. The frame is a "C" shape. To go from the upper left to the lower right along the frame, the player would go: down the left side of the C, then right along the bottom of the C. That's the path I found (DOWN×7, RIGHT×5). But the red L blocks it (the horizontal red line at row 40 crosses the left side of the C, and the vertical red line at column 40 crosses the upper right).
+Wait, but the red L is inside the C, not on the frame. Let me reconsider.
+Actually, I think I need to reconsider the maze structure completely. Let me re-map it properly. The problem with the block map was the column range. Let me fix it and re-run.
+Actually, let me reconsider. The key question is: what is the walkable region, and is there a path from the player to the goal?
+Let me reconsider the maze as a "C" shape:
+- The frame of the C is black (walkable).
+- The interior of the C is white (wall).
+- The red L is inside, on the frame or in the interior.
+Wait, the red vertical line is at column 40, rows 9-40. The red horizontal line is at row 40, columns 14-40. So the red L is in the upper right / center of the maze.
+Let me reconsider the C shape. Actually, let me look at the image once more. The shape is:
+- A thick black "C" opening to the right? Or is it closed?
+Let me re-map the maze properly. Let me fix the block map (correct column range) and also output a coarse ASCII map of the whole maze (black/white/red) to understand the structure.
+Let me output a coarse map: for each 4x4 block, the dominant color. That should let me see the shape of the maze.
+Actually, let me output a downsampled version of the whole board: sample every 4 rows and every 4 columns, and output the color. That gives a 16x16 map. That should let me see the maze structure.
+Let me do that.
+Actually, the board is 64x64. Sampling every 4 gives 16x16. Let me output that with the color characters. That's compact enough (16 rows of 16 characters).
+Let me do that to understand the maze structure.
+[ASSISTANT TOOL CALL: python]
+id: chatcmpl-tool-94a4ee8127938e84
+<tool_call>
+<function=python>
+<parameter=code>
+g=[list(line) for line in current_frame.ascii.split('\n')]
+H=len(g); W=max(len(r) for r in g)
+print("grid",H,W)
+# downsample 4x: dominant color per 4x4 block
+def dom(block):
+    from collections import Counter
+    cnt=Counter(block)
+    return cnt.most_common(1)[0][0]
+print("--- 16x16 downsampled (each char = 4x4 block dominant color) ---")
+for R in range(0,H,4):
+    line=""
+    for C in range(0,W,4):
+        block=[g[r][c] for r in range(R,min(R+4,H)) for c in range(C,min(C+4,W))]
+        line+=dom(block)
+    print(line)
+</parameter>
+</function>
+</tool_call>
+
+[TOOL RESULT: chatcmpl-tool-94a4ee8127938e84]
+grid 64 64
+--- 16x16 downsampled (each char = 4x4 block dominant color) ---
+WwWWWWWWWWWWWWWW
+WWWWWWWWWWWWWWWW
+WWWBBBBBBBBWWWWW
+WWWBBBBBBBBWWWWW
+WWWBBWBBWWWWWWWW
+WWWBBBBBWWWWWWWW
+WWWBBBBBWWWWWWWW
+WWWBBWWWWWWWWWWW
+WWWbbWWWWWWWWWWW
+WWWBBWWWWWWWWWWW
+WWWBRWWWWWWWWWWW
+WWWBBWWWWWWWWWWW
+WWWBBBBBBBBBBWWW
+WWWBBBBBBBBBBWWW
+WWWWWWWWWWWWWWWW
+WWWWWWWWWWWWWWWW
+
+[USER]
+The code executed 7 actions in the previous sequence.
+Executed actions: DOWN, DOWN, DOWN, DOWN, DOWN, RIGHT, RIGHT.
+You are still on the same level.
+Current state: step 24, level 1.
+Valid actions right now: UP, DOWN, LEFT, RIGHT, SPACE.
+Only tool: `python`. It receives `current_frame`, `previous_frame`, `history`, `transitions`, `last_transition`, `valid_actions`, `last_action_result`, and `action(actions)`.
+Only letter-coded board views and lightweight metadata are exposed; raw numeric color IDs are not available.
+Keep tool output compact: use `current_frame.segmentation` as the primary view, and `current_frame.ascii` only for a small specific region; never print full boards.
+For the most recent change, compare `previous_frame` to `current_frame`, or `last_transition.before_frame` to `last_transition.after_frame`; `history[-1].frame` is the current frame, not the previous one.
+Use Python to inspect the evidence, refine that world model from the newest history, and search or score candidate actions or short sequences against the current goal as you currently understand it.
+Maintain a compact working world model of what the current level seems to contain, what actions appear to do, what the goal seems to be, what is still uncertain, and what plan currently looks best.
+Below you are provided with the current world model from the previous turn. The default behavior is to copy it and add or remove things based on the evidence that you gathered. BEFORE EXECUTING NEW ACTIONS YOU MUST ALWAYS GIVE THE REVISED VERSION OF THE WORLD MODEL.
+You may call `action(actions)` more than once in one Python snippet if your search or control loop needs it, but stop immediately if a result reports `game_over`, `run_complete`, `level_completed`, or `done`.
+Working world model carried from earlier turns:
+- Plan: Execute LEFT + 5×DOWN first, verify the red crossing worked, then do 5×RIGHT.
+- Revise any item above immediately if `current_frame` or `history` contradicts it.
+end of world model. 
+Focus on what changed most recently in `history`, update the target environment change if needed, and separate gameplay-object changes from HUD-only changes.
+When ready, call `action(actions)` from inside the `python` tool with the best valid action or ordered batch selected by your code. If your code has found a reliable short sequence, prefer batching it in one call.
+You may call `action(actions)` more than once in one Python snippet if your search or control loop needs it.
+If you include assistant text before a tool call, keep it short and use it to update the world model. Helpful optional prefixes are `World model:`, `Goal model:`, `Action model:`, `Recent findings:`, `Open questions:`, `Plan:`, and `Cross-level notes:`.
+When calling `python`, emit exactly the tool-call format shown elsewhere in this prompt for this model. Use only that format; do not add markdown fences, prose wrappers, or alternate tool-call syntax. Do not quote or place tool-call markup inside explanatory text; when you decide to call the tool, emit the tool call itself.
+Current grid image:
+
+[TURN TRANSCRIPT SO FAR]
+--- analysis_step=10 | action=24 | 16:48:49 | tool-agent ---
+[SYSTEM PROMPT]
+You are a coding agent solving a grid-based puzzle game.
+
+Game overview:
+- You are solving a multi-level grid puzzle game. 
+- You are called repeatedly over the course of a run. Treat each turn as one observe-plan-act cycle: re-understand the current state from the newest frame, update your working world model in Python, choose the next best action or short sequence against the goal as currently understood, execute it, and expect to re-evaluate on the next turn from the updated state.
+- Your job is to solve the entire game by clearing every level, not just the current screen.
+- Levels often build on earlier mechanics, but layouts and interactions can still change between levels.
+- Optimize for as few in-game actions as possible while still being reliable.
+- In this environment, boards are presented as 64 x 64 color grids rendered with ARC color symbols.
+- Color legend: W=white, w=light gray, g=gray, G=dark gray, c=charcoal, B=black, M=magenta, P=pink, R=red, b=blue, S=sky blue, Y=yellow, O=orange, r=dark red, N=light green, p=purple.
+
+
+Runtime variables inside every `python` tool call:
+- `current_frame` is a lightweight frame view for the latest environment state.
+- `current_frame` exposes only `.ascii`, `.step`, `.level`, `.shape`, and `.segmentation`.
+- `current_frame.ascii` is a single newline-delimited string containing the latest board rendered with the letter-coded ARC color symbols.
+- `current_frame.segmentation` parses the board into objects. It returns `{'nodes': [...], 'adjacency_list': [...]}`.
+- Each node in `segmentation['nodes']` is one 4-connected same-color object with: `id` (index, ordered top-most-left-most), `color` (ARC color character), `hash` (a signature of the object's color and shape that ignores its position -- equal hashes mean the same object regardless of where it is, so use it to track an object across frames or to spot multiple identical objects in one frame), `pixels` (cell count), `boundary` (clockwise outer-perimeter corner points as `[row, col]`), and `children` (ids of objects fully enclosed by this one).
+- `segmentation['adjacency_list']` is a list of `[i, j]` node-id pairs whose objects share an edge.
+- `current_frame.step` is the current environment step count.
+- `current_frame.level` is the current level number.
+- `current_frame.shape` is a `(rows, cols)` tuple.
+- The raw numeric grid is intentionally not exposed. Use `current_frame.segmentation` as your primary view of the board -- objects, colors, shapes, containment, adjacency, and cross-frame object hashes. Use `current_frame.ascii` only to read a small, specific region; do not scan the whole board with it.
+- `history` is a chronological list of action/frame snapshots.
+- `history` is a Python list of objects, not a dict.
+- Each history entry exposes only `.action` and `.frame`; entries are not subscriptable like `entry['action']`.
+- Each `history[i].frame` is the frame after `history[i].action`; each frame exposes only `.ascii`, `.step`, `.level`, `.shape`, and `.segmentation`.
+- Important history semantics: when `history` is non-empty, `history[-1].frame` is the same latest/post-action board as `current_frame`. It is not the previous board. To inspect the state before the latest action, use `previous_frame` or `history[-2].frame` when available.
+- `previous_frame` is the frame before the most recent real environment action, or `None` if no previous frame is available.
+- `last_action` is the most recent real environment action name/display, or `None` before any real action.
+- `last_action_frame` is the post-action frame for `last_action`; it matches `current_frame` after a real action.
+- `transitions` is a chronological list of actual action transitions, excluding the initial seeded frame. Each transition exposes `.action`, `.before_frame`, `.after_frame`, `.frame` (alias of `.after_frame`), and `.result`.
+- `last_transition` is `transitions[-1]` or `None`. Its `.result` mirrors `last_action_result`; older transitions may have an empty `.result`. For before/after diffs, compare `last_transition.before_frame` to `last_transition.after_frame`; do not compare `current_frame` to `history[-1].frame`.
+- `last_action_result` is the persisted result dict from the most recent `action(...)` call. It remains available across later Python inspection calls that do not call `action(...)`, and is `{}` before any action result exists. Read transition metadata from fields/keys such as `last_action_result['board_changed']`, `last_action_result['done']`, `last_action_result['level_completed']`, `last_action_result['game_over']`, `last_action_result['run_complete']`, `last_action_result['reward']`, and `last_action_result['valid_actions']`.
+- `valid_actions` is the current list of valid action names.
+- Call `action(actions)` to execute one or more real environment actions from Python.
+- Pass `action(actions)` a list like `['LEFT']` or `[{'action': 'MOUSE', 'row': 4, 'col': 7}]`.
+- One action usually returns one frame, but a single action can result in a short multi-frame animation; `current_frame` is always the final frame of that animation. When present, `last_action_result['animation']['worth_inspecting']` means the hidden frames are worth reading, and `['board_unchanged']` means the action's only visible effect -- a rejected click, a consumed attempt, a bounce off a wall -- lives in those hidden frames, not a no-op; no `animation` key means nothing was hidden. Call `animation()` for the diff timeline in either case.
+- `animation()` costs no in-game action and no action budget.
+- After `action(actions)` returns, `current_frame`, `previous_frame`, `history`, `transitions`, `valid_actions`, and `last_action_result` are refreshed.
+
+
+Multimodal context:
+- User turns include an attached image of the current ARC grid.
+- The image and `current_frame.ascii` are two representations of the same current frame.
+- You can use images and other tools to understand the game state and guide your strategy, each may be useful depending on the current uncertainty.
+
+
+Visual-game guidance:
+- Treat each board as a scene with objects, blockers, targets, adjacency, containment, motion, and symmetry.
+- Game entities are usually be rendered as connected multi-tile shapes such as 2×2, 2×3, 3×3, or longer patterned structures. Sometime they might also be 1x1 tokens.- Some games are logic or layout puzzles with no explicit player avatar or controllable sprite on the board. Do not assume a player exists; the relevant state may be an object, region, cursor, selector, or whole-board configuration.
+- Background colors are often white or gray/black-ish large regions, but not always. Verify background hypotheses by area, stability, and object boundaries rather than assuming them.
+- In many games, a long horizontal or vertical line near an edge is a timer or remaining-steps bar. It often shrinks or changes each step. If you identify such a bar, do not get distracted by it or treat it as core gameplay state unless there is concrete evidence that it interacts with the puzzle mechanics.
+A common failure mode is to mistake a segmented edge bar for clickable puzzle pieces. If a repeated strip of small blocks sits flush against the top, bottom, left, or right border and actions only change that strip while the interior board stays the same, classify it as HUD/timer state, not as an object to click through segment by segment. DON'T DO THIS!
+- Use coordinates only to target actions or describe local evidence. Do not frame the objective as reaching a specific absolute row or column.
+- Re-ground on the newest frame after any score increase or abrupt scene change; the returned board may already be the next level.
+- `WIN` means the whole game is solved. Mid-run level completion is more likely to appear as a score increase while play continues.
+- Strategies may transfer loosely across levels, but layouts and mechanics can change. Re-check the new board before repeating a plan.
+- For `MOUSE`, pass `row` and `col` integer arguments. `row` is vertical position, `col` is horizontal position.
+
+
+Python tool guidance:
+- Use `current_frame.segmentation` as your primary view of the board -- objects, colors, containment, adjacency, and cross-frame object hashes.
+- Use `current_frame.ascii` only to read a small, specific region of the board when `segmentation` is not enough; never use it to scan or summarize the whole board.
+- Every `python` tool call starts fresh. Re-import modules or re-define any custom utility logic you need.
+- The only importable standard-library modules are: bisect, collections, copy, fractions, functools, heapq, itertools, json, math, operator, random, re, statistics, string.
+- The only tool is `python`; call it with one ephemeral `code` string.
+- Always inspect `current_frame`, `history`, and `valid_actions` from Python instead of reasoning from the raw board by eye.
+- For the most recent change, compare `previous_frame` to `current_frame`, or `last_transition.before_frame` to `last_transition.after_frame`. `history[-1].frame` is the current frame, so comparing it to `current_frame` only compares the board to itself.
+- Maintain a compact working world model: what entities or regions exist, what actions seem to do, what the goal likely is, what remains uncertain, and what plan best fits the evidence so far.
+- IMPORTANT: Especially when the game is about making an agent navigate to a target, it is usually safer to write an explicit search algorithm such as BFS. More generally, when the objective is understood but the best action order is unclear, pathfinding, flood fill, BFS, DFS, beam search, shortest-path search, limited action-sequence search, or custom heuristics are all valid.
+- Optimize for the shortest reliable sequence that advances the current goal as described by your world model. If confidence is low, program a discriminating probe and revise the world model from the result.
+- Once the important state variables and action effects are sufficiently understood, stop probing and search in the inferred state space.
+- Inspect current and history frames from Python instead of describing frames freehand.
+- Never print or echo full board frames. Return only compact derived summaries such as object lists, diffs, coordinates, counts, or tiny local crops.
+- Keep tool-output context size minimal and decision-oriented so you can quickly compare before/after state. It's fine to write a lot of python code, just make the output short and interpretable
+- A strong default loop is: summarize the board, infer the desired environment change, write a small scorer or search over candidate sequences, execute the best probe or plan with `action(...)`, then inspect again until you understand exactly what changed.
+- For object tracking, match objects by color, overlap, bounding box proximity, area change, and edge contact rather than by exact coordinates alone.
+- For frame diffs, summarize changed cells, color transitions, appearing/disappearing components, movement candidates, and small local row slices around the changed region.
+- After every action, verify whether gameplay objects changed or whether only a timer, progress bar, or remaining-step bar moved. Do not treat HUD-only changes as evidence that the move worked.
+- Use `print(...)` for compact summaries, or assign a final compact object to `result`.
+- Call `action(...)` inside Python rather than returning action text in the chat.
+- `action(...)` accepts an ordered list of one or more actions. Once your code has selected a reliable sequence, it is often useful to batch it.
+- You can also call `action(...)` multiple times in one Python snippet, including inside loops. Each call updates the preloaded variables before execution continues.
+- If an action result reports `game_over`, `run_complete`, `level_completed`, or `done`, stop acting immediately and re-ground on the next turn.
+
+
+Tool session rules:
+- You have exactly one tool: `python`.
+- When calling `python`, emit exactly the tool-call format shown elsewhere in this prompt for this model. Use only that format; do not add markdown fences, prose wrappers, or alternate tool-call syntax. Do not quote or place tool-call markup inside explanatory text; when you decide to call the tool, emit the tool call itself.
+- The `python` tool code is not saved between calls, so rewrite any custom utility logic you still need.
+- You can call the `python` tool as many times as you want per step. Investigate until your code has a clear probe or plan.
+- Do not ration tool calls when the state is unclear. Spend extra tool calls to confirm what changed between frames and whether the last action affected gameplay state or only HUD elements such as countdown bars.
+- After `action(...)` returns, the structured runtime state is refreshed before the next Python statement and before the next tool call. Inspection-only Python calls do not clear `last_action_result`.
+- Each `python` tool call has a hard time limit of 30 seconds.
+- Tool responses are capped to about 1024 tokens. If a response is cut off, the tool result will tell you that.
+- Keep code snippets short and purpose-built rather than dumping large frameworks into one call.
+
+[USER PROMPT]
+The code executed 7 actions in the previous sequence.
+Executed actions: DOWN, DOWN, DOWN, DOWN, DOWN, RIGHT, RIGHT.
+You are still on the same level.
+Current state: step 24, level 1.
+Valid actions right now: UP, DOWN, LEFT, RIGHT, SPACE.
+Only tool: `python`. It receives `current_frame`, `previous_frame`, `history`, `transitions`, `last_transition`, `valid_actions`, `last_action_result`, and `action(actions)`.
+Only letter-coded board views and lightweight metadata are exposed; raw numeric color IDs are not available.
+Keep tool output compact: use `current_frame.segmentation` as the primary view, and `current_frame.ascii` only for a small specific region; never print full boards.
+For the most recent change, compare `previous_frame` to `current_frame`, or `last_transition.before_frame` to `last_transition.after_frame`; `history[-1].frame` is the current frame, not the previous one.
+Use Python to inspect the evidence, refine that world model from the newest history, and search or score candidate actions or short sequences against the current goal as you currently understand it.
+Maintain a compact working world model of what the current level seems to contain, what actions appear to do, what the goal seems to be, what is still uncertain, and what plan currently looks best.
+Below you are provided with the current world model from the previous turn. The default behavior is to copy it and add or remove things based on the evidence that you gathered. BEFORE EXECUTING NEW ACTIONS YOU MUST ALWAYS GIVE THE REVISED VERSION OF THE WORLD MODEL.
+You may call `action(actions)` more than once in one Python snippet if your search or control loop needs it, but stop immediately if a result reports `game_over`, `run_complete`, `level_completed`, or `done`.
+Working world model carried from earlier turns:
+- Plan: Execute LEFT + 5×DOWN first, verify the red crossing worked, then do 5×RIGHT.
+- Revise any item above immediately if `current_frame` or `history` contradicts it.
+end of world model. 
+Focus on what changed most recently in `history`, update the target environment change if needed, and separate gameplay-object changes from HUD-only changes.
+When ready, call `action(actions)` from inside the `python` tool with the best valid action or ordered batch selected by your code. If your code has found a reliable short sequence, prefer batching it in one call.
+You may call `action(actions)` more than once in one Python snippet if your search or control loop needs it.
+If you include assistant text before a tool call, keep it short and use it to update the world model. Helpful optional prefixes are `World model:`, `Goal model:`, `Action model:`, `Recent findings:`, `Open questions:`, `Plan:`, and `Cross-level notes:`.
+When calling `python`, emit exactly the tool-call format shown elsewhere in this prompt for this model. Use only that format; do not add markdown fences, prose wrappers, or alternate tool-call syntax. Do not quote or place tool-call markup inside explanatory text; when you decide to call the tool, emit the tool call itself.
+
+[ANALYZER STATUS]
+request_error: HTTPConnectionPool(host='127.0.0.1', port=1234): Read timed out. (read timeout=152.58484595399932)

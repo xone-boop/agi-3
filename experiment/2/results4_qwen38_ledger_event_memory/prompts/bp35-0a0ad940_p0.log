@@ -1,0 +1,776 @@
+LATEST MODEL CALL SNAPSHOT
+model: Qwen3.8-27B-FP8
+base_url: http://127.0.0.1:1234/v1
+analysis_step: 19
+action: 60
+request_index_within_turn: 1
+message_count: 16
+tool_choice: auto
+
+[AVAILABLE TOOLS]
+- python: Run one ephemeral Python snippet against preloaded ASCII game state. Available globals: `current_frame`, `previous_frame`, `history`, `transitions`, `last_transition`, `valid_actions`, `last_action_result`, `ledger`, `ledger_validation`, `execution_ledger`, `world_model_ledger`, `verification_ledger`, `coverage_ledger`, and `action(actions)` for executing one or more real environment actions. `current_frame` and each `history[*].frame` expose only `.ascii`, `.segmentation`, `.step`, and `.level`; `history[-1].frame` is the current post-action frame, not the previous frame. For before/after diffs, compare `previous_frame` to `current_frame` or use `last_transition.before_frame` and `.after_frame`. For canonical ACTION6, pass `row` and `col` integer fields; legacy x/y fields are rejected. The raw numeric grid is not available. Use `.segmentation` as the primary view; use `.ascii` only to read a small, specific region. Use `print(...)` for compact output or assign final data to `result`.
+
+[MODEL INPUT]
+[SYSTEM]
+You are a coding agent solving a grid-based puzzle game.
+Game overview:
+- You are solving a multi-level grid puzzle game. 
+- You are called repeatedly over the course of a run. Treat each turn as one observe-plan-act cycle: re-understand the current state from the newest frame, update your working world model in Python, choose the next best action or short sequence against the goal as currently understood, execute it, and expect to re-evaluate on the next turn from the updated state.
+- Your job is to solve the entire game by clearing every level, not just the current screen.
+- An action's learned meaning normally persists across levels of the same game. Availability, target, and preconditions may still vary by level; create a level-specific semantic override only after contradictory evidence.
+- Across different games, learned action meanings reset to hypotheses; only the standardized interface contract transfers.
+- Optimize for as few in-game actions as possible while still being reliable.
+- In this environment, boards are presented as 64 x 64 color grids rendered with ARC color symbols.
+- Color legend: W=white, w=light gray, g=gray, G=dark gray, c=charcoal, B=black, M=magenta, P=pink, R=red, b=blue, S=sky blue, Y=yellow, O=orange, r=dark red, N=light green, p=purple.
+Runtime variables inside every `python` tool call:
+- `current_frame` is a lightweight frame view for the latest environment state.
+- `current_frame` exposes only `.ascii`, `.step`, `.level`, `.shape`, and `.segmentation`.
+- `current_frame.ascii` is a single newline-delimited string containing the latest board rendered with the letter-coded ARC color symbols.
+- `current_frame.segmentation` parses the board into objects. It returns `{'nodes': [...], 'adjacency_list': [...]}`.
+- Each node in `segmentation['nodes']` is one 4-connected same-color object with: `id` (index, ordered top-most-left-most), `color` (ARC color character), `hash` (a signature of the object's color and shape that ignores its position -- equal hashes mean the same object regardless of where it is, so use it to track an object across frames or to spot multiple identical objects in one frame), `pixels` (cell count), `boundary` (clockwise outer-perimeter corner points as `[row, col]`), and `children` (ids of objects fully enclosed by this one).
+- `segmentation['adjacency_list']` is a list of `[i, j]` node-id pairs whose objects share an edge.
+- `current_frame.step` is the current environment step count.
+- `current_frame.level` is the current level number.
+- `current_frame.shape` is a `(rows, cols)` tuple.
+- The raw numeric grid is intentionally not exposed. Use `current_frame.segmentation` as your primary view of the board -- objects, colors, shapes, containment, adjacency, and cross-frame object hashes. Use `current_frame.ascii` only to read a small, specific region; do not scan the whole board with it.
+- `history` is a chronological list of action/frame snapshots.
+- `history` is a Python list of objects, not a dict.
+- Each history entry exposes only `.action` and `.frame`; entries are not subscriptable like `entry['action']`.
+- Each `history[i].frame` is the frame after `history[i].action`; each frame exposes only `.ascii`, `.step`, `.level`, `.shape`, and `.segmentation`.
+- Important history semantics: when `history` is non-empty, `history[-1].frame` is the same latest/post-action board as `current_frame`. It is not the previous board. To inspect the state before the latest action, use `previous_frame` or `history[-2].frame` when available.
+- `previous_frame` is the frame before the most recent real environment action, or `None` if no previous frame is available.
+- `last_action` is the most recent real environment action name/display, or `None` before any real action.
+- `last_action_frame` is the post-action frame for `last_action`; it matches `current_frame` after a real action.
+- `transitions` is a chronological list of actual action transitions, excluding the initial seeded frame. Each transition exposes `.action`, `.before_frame`, `.after_frame`, `.frame` (alias of `.after_frame`), and `.result`.
+- `last_transition` is `transitions[-1]` or `None`. Its `.result` mirrors `last_action_result`; older transitions may have an empty `.result`. For before/after diffs, compare `last_transition.before_frame` to `last_transition.after_frame`; do not compare `current_frame` to `history[-1].frame`.
+- `last_action_result` is the persisted result dict from the most recent `action(...)` call. It remains available across later Python inspection calls that do not call `action(...)`, and is `{}` before any action result exists. Read transition metadata from fields/keys such as `last_action_result['board_changed']`, `last_action_result['done']`, `last_action_result['level_completed']`, `last_action_result['game_over']`, `last_action_result['run_complete']`, `last_action_result['reward']`, and `last_action_result['valid_actions']`.
+- `last_action_in_valid_action` reports whether the most recent action was legal under the valid-action list before it ran.
+- `telemetry` contains recent observation hashes, task/observable progress streaks, HUD/gameplay change classification, and changed-cell samples. An observation hash is not proof of complete latent-state identity.
+- `telemetry['task_no_progress_streak']` counts actions without engine task progress; `observable_no_change_streak` counts unchanged observations; `repeated_action_streak` counts identical displayed actions.
+- `level_transition` contains the last two frames and last five actions around the most recent level transition when one occurred.
+- `ledger` is the compact authoritative Inform view. `execution_ledger`, `world_model_ledger`, `verification_ledger`, and `coverage_ledger` expose its structured components; free prose is non-authoritative.
+- `ledger_validation` reports semantic-schema invariant failures without silently coercing or deleting evidence.
+- `hypotheses` contains structured candidates and predictions. Facts are separate from hypotheses, and unexecuted requests are never no-op evidence.
+- Record reusable claims with `record_hypothesis({...})` (alias `record_expectation`). Use a kind from `object_role`, `action_function`, `affordance`, `precondition`, or `completion_condition`; aliases are normalized but these canonical kinds produce the clearest world model.
+- Observable prediction fields include `state_changed`, `gameplay_changed`, `hud_changed`, `progress_changed`, `level_completed`, `run_complete`, and `object_changes.moved|added|removed|resized`. Unknown fields remain explicitly non-evaluable instead of becoming evidence.
+- Prefer an action object carrying its immediate hypothesis and possibly absent target, for example `{'action':'ACTION3','hypothesis':{'claim':'moves the bound object left','expected_gameplay_change':True,'confidence':0.4},'target_object':{'description':'candidate token','presence':'possible'}}`. Legacy strings remain accepted and receive only an implicit low-confidence intent.
+- A descriptive effect without an observable predicate is preserved but verifies as inconclusive, not supported or refuted.
+- `valid_actions` is the current list of advertised canonical action IDs. Not advertised, rejected, unexecuted, and executed-with-no-observable-change are distinct outcomes.
+- Call `action(actions)` to execute one or more real environment actions from Python.
+- Pass `action(actions)` a list like `['ACTION3']` or `[{'action': 'ACTION6', 'row': 4, 'col': 7}]`.
+- One action usually returns one frame, but a single action can result in a short multi-frame animation.
+- After `action(actions)` returns, `current_frame`, `previous_frame`, `history`, `transitions`, `valid_actions`, and `last_action_result` are refreshed.
+Multimodal context:
+- User turns include an attached image of the current ARC grid.
+- The image and `current_frame.ascii` are two representations of the same current frame.
+- You can use images and other tools to understand the game state and guide your strategy, each may be useful depending on the current uncertainty.
+Visual-game guidance:
+- Treat each board as a scene with objects, blockers, targets, adjacency, containment, motion, and symmetry.
+- Game entities are usually be rendered as connected multi-tile shapes such as 2×2, 2×3, 3×3, or longer patterned structures. Sometime they might also be 1x1 tokens.- Some games are logic or layout puzzles with no explicit player avatar or controllable sprite on the board. Do not assume a player exists; the relevant state may be an object, region, cursor, selector, or whole-board configuration.
+- Background colors are often white or gray/black-ish large regions, but not always. Verify background hypotheses by area, stability, and object boundaries rather than assuming them.
+- In many games, a long horizontal or vertical line near an edge is a timer or remaining-steps bar. It often shrinks or changes each step. If you identify such a bar, do not get distracted by it or treat it as core gameplay state unless there is concrete evidence that it interacts with the puzzle mechanics.
+A common failure mode is to mistake a segmented edge bar for clickable puzzle pieces. If a repeated strip of small blocks sits flush against the top, bottom, left, or right border and actions only change that strip while the interior board stays the same, classify it as HUD/timer state, not as an object to click through segment by segment. DON'T DO THIS!
+- Use coordinates only to target actions or describe local evidence. Do not frame the objective as reaching a specific absolute row or column.
+- Re-ground on the newest frame after any score increase or abrupt scene change; the returned board may already be the next level.
+- `WIN` means the whole game is solved. Mid-run level completion is more likely to appear as a score increase while play continues.
+- Strategies may transfer loosely across levels, but layouts and mechanics can change. Re-check the new board before repeating a plan.
+- `ACTION1`...`ACTION7` are canonical engine IDs, not semantic facts. Direction/interaction labels are interface priors only.
+- For coordinate action `ACTION6`, pass `row` and `col` integer arguments. `row` is vertical position, `col` is horizontal position.
+Python tool guidance:
+- Use `current_frame.segmentation` as your primary view of the board -- objects, colors, containment, adjacency, and cross-frame object hashes.
+- Use `current_frame.ascii` only to read a small, specific region of the board when `segmentation` is not enough; never use it to scan or summarize the whole board.
+- Every `python` tool call starts fresh. Re-import modules or re-define any custom utility logic you need.
+- The only importable standard-library modules are: bisect, collections, copy, fractions, functools, heapq, itertools, json, math, operator, random, re, statistics, string.
+- The only tool is `python`; call it with one ephemeral `code` string.
+- Always inspect `current_frame`, `history`, and `valid_actions` from Python instead of reasoning from the raw board by eye.
+- For the most recent change, compare `previous_frame` to `current_frame`, or `last_transition.before_frame` to `last_transition.after_frame`. `history[-1].frame` is the current frame, so comparing it to `current_frame` only compares the board to itself.
+- Maintain candidate object roles, per-game action functions, object-action affordances, preconditions, completion-condition hypotheses, and explicit unknown coverage. The only fixed objective is to complete the whole game (`WIN`).
+- IMPORTANT: Especially when the game is about making an agent navigate to a target, it is usually safer to write an explicit search algorithm such as BFS. More generally, when the objective is understood but the best action order is unclear, pathfinding, flood fill, BFS, DFS, beam search, shortest-path search, limited action-sequence search, or custom heuristics are all valid.
+- Optimize for the shortest reliable sequence that advances the current goal as described by your world model. If confidence is low, program a discriminating probe and revise the world model from the result.
+- Once the important state variables and action effects are sufficiently understood, stop probing and search in the inferred state space.
+- Inspect current and history frames from Python instead of describing frames freehand.
+- Never print or echo full board frames. Return only compact derived summaries such as object lists, diffs, coordinates, counts, or tiny local crops.
+- Keep tool-output context size minimal and decision-oriented so you can quickly compare before/after state. It's fine to write a lot of python code, just make the output short and interpretable
+- A strong default loop is: summarize the board, infer the desired environment change, write a small scorer or search over candidate sequences, execute the best probe or plan with `action(...)`, then inspect again until you understand exactly what changed.
+- For object tracking, match objects by color, overlap, bounding box proximity, area change, and edge contact rather than by exact coordinates alone. Treat identity as confidence-bearing inference, not fact.
+- Movement vectors use screen coordinates (`delta_row`, `delta_col`). Do not call coherent multi-object motion camera movement until repeated evidence distinguishes it from reset, board rotation, or a group mechanic.
+- For frame diffs, summarize changed cells, color transitions, appearing/disappearing components, movement candidates, and small local row slices around the changed region.
+- After every action, verify whether gameplay objects changed or whether only a timer, progress bar, or remaining-step bar moved. Do not treat HUD-only changes as evidence that the move worked.
+- Streaks are evidence, not automatic stop rules. Repeating one action is allowed when the world model predicts a useful intermediate state or required displacement.
+- Learn action patterns, not isolated moves: record short tested sequences such as `X -> U` and their precondition, observed effect, cost, and outcome. Do not call a sequence a combination until each step's effect and ordering are supported by transitions.
+- Treat plans as causal prerequisites: define target outcome `Y`, identify prerequisite state `X`, test `X`, then test `Y`; preserve ordering when `Y` fails without `X` and succeeds after `X`. A repeated or zero-progress prefix may still be necessary preparation.
+- When a tested pattern does not improve the goal, mark that pattern/state-context as weak or rejected and avoid retrying the same pattern unchanged. Retry only with changed state, changed parameters, or a new causal hypothesis.
+- Use `print(...)` for compact summaries, or assign a final compact object to `result`.
+- Call `action(...)` inside Python rather than returning action text in the chat.
+- `action(...)` accepts an ordered list of one or more actions. Once your code has selected a reliable sequence, it is often useful to batch it.
+- You can also call `action(...)` multiple times in one Python snippet, including inside loops. Each call updates the preloaded variables before execution continues.
+- If an action result reports `game_over`, `run_complete`, `level_completed`, or `done`, stop acting immediately and re-ground on the next turn.
+Tool session rules:
+- You have exactly one tool: `python`.
+- When calling `python`, emit exactly the tool-call format shown elsewhere in this prompt for this model. Use only that format; do not add markdown fences, prose wrappers, or alternate tool-call syntax. Do not quote or place tool-call markup inside explanatory text; when you decide to call the tool, emit the tool call itself.
+- The `python` tool code is not saved between calls, so rewrite any custom utility logic you still need.
+- You can call the `python` tool as many times as you want per step. Investigate until your code has a clear probe or plan.
+- Do not ration tool calls when the state is unclear. Spend extra tool calls to confirm what changed between frames and whether the last action affected gameplay state or only HUD elements such as countdown bars.
+- After `action(...)` returns, the structured runtime state is refreshed before the next Python statement and before the next tool call. Inspection-only Python calls do not clear `last_action_result`.
+- Each `python` tool call has a hard time limit of 30 seconds.
+- Tool responses are capped to about 2048 tokens. If a response is cut off, the tool result will tell you that.
+- Keep code snippets short and purpose-built rather than dumping large frameworks into one call.
+
+[USER]
+The code executed 8 actions in the previous sequence.
+Executed actions: ACTION6(row=27, col=15), ACTION6(row=27, col=21), ACTION6(row=27, col=27), ACTION6(row=27, col=33), ACTION6(row=27, col=39), ACTION6(row=27, col=45), ACTION6(row=27, col=51), ACTION6(row=33, col=15).
+You are still on the same level.
+Current state: step 50, level 2.
+Valid actions right now: ACTION3, ACTION4, ACTION6, ACTION7.
+Only tool: `python`. It receives `current_frame`, `previous_frame`, `history`, `transitions`, `last_transition`, `valid_actions`, `last_action_result`, `runtime_memory`, `telemetry`, `ledger`, `ledger_validation`, `execution_ledger`, `world_model_ledger`, `verification_ledger`, `coverage_ledger`, `memory`, `dynamics`, `continuity`, `hypotheses`, `level_transition`, `last_action_in_valid_action`, `record_hypothesis(...)`, and `action(actions)`.
+Only letter-coded board views and lightweight metadata are exposed; raw numeric color IDs are not available.
+Keep tool output compact: use `current_frame.segmentation` as the primary view, and `current_frame.ascii` only for a small specific region; never print full boards.
+For the most recent change, compare `previous_frame` to `current_frame`, or `last_transition.before_frame` to `last_transition.after_frame`; `history[-1].frame` is the current frame, not the previous one.
+Use Python to inspect the evidence, refine that world model from the newest history, and search or score candidate actions or short sequences against the current goal as you currently understand it.
+Use the structured ledger for authoritative facts and evidence: action meanings are learned per game by default, while availability, target, and preconditions can vary by level or state. Interface hints are priors, not facts.
+Treat `last_action_result`, `execution_ledger`, and `runtime_memory.telemetry` as authoritative transition evidence. Distinguish not-advertised, adapter/parameter/engine failure, executed no-observable-change, observable change, task progress, and terminal failure.
+Model combinations as causal action sequences, not labels: write target Y, prerequisite state X, action order, expected transition after each step, and evidence. A step can be useful preparation even when it gives no immediate reward. Reuse tested sequences only in matching state context; reject unchanged retries that previously failed.
+For each action object, include the immediate test hypothesis and target-object presence claim when known; the target may be possible, unknown, or absent in this level. Keep reusable mechanics in record_hypothesis(...).
+Free-text working notes below are optional and non-authoritative; revise them when useful, while recording testable claims and observable predictions in `record_hypothesis(...)`.
+You may call `action(actions)` more than once in one Python snippet if your search or control loop needs it, but stop immediately if a result reports `game_over`, `run_complete`, `level_completed`, or `done`.
+end of optional working notes. 
+Focus on what changed most recently in `history`, update the target environment change if needed, and separate gameplay-object changes from HUD-only changes.
+When ready, call `action(actions)` from inside the `python` tool with the best valid action or ordered batch selected by your code. If your code has found a reliable short sequence, prefer batching it in one call.
+You may call `action(actions)` more than once in one Python snippet if your search or control loop needs it.
+If you include assistant text before a tool call, keep it short and use it to update the world model. Helpful optional prefixes are `World model:`, `Goal model:`, `Action model:`, `Recent findings:`, `Open questions:`, `Plan:`, and `Cross-level notes:`.
+When calling `python`, emit exactly the tool-call format shown elsewhere in this prompt for this model. Use only that format; do not add markdown fences, prose wrappers, or alternate tool-call syntax. Do not quote or place tool-call markup inside explanatory text; when you decide to call the tool, emit the tool call itself.
+If you use ACTION6, include integer row and col arguments.
+Structured continuity recall (fact/evidence IDs only; inspect the Ledger for details):
+{"active_belief_ids":["H51","H52","H53","H54","H55","H56","H57","H58","H59","H60","H61"],"contested_belief_ids":[],"current_plan":{},"level":2,"mechanic_ids":[],"memory":"ledger-backed","objective":"complete_level","recent_evidence_ids":["T42","T43","T44","T45","T46","T47","T48","T52"],"unknown_ids":[]}
+{"active_belief_ids":[],"avoid_sequence_ids":["S27"],"boundary":"context_rollover","contested_belief_ids":[],"current_state_ref":"T40","game_id":"bp35-0a0ad940","level":2,"objective":"complete_game","plan":{},"recent_evidence_ids":["T40"],"scene_graph_ref":null,"unknown_ids":[]}
+End structured continuity recall.
+Current grid image:
+
+[ASSISTANT]
+The board **morphed** while clearing greens (sky 857→1438, greens 14→17) — so morphs can trigger from clearing greens too, not just char moves. Let me map the new layout.
+[REASONING]
+Interesting! The board changed. The sky went from 857 to 1438, and the greens went from 14 to 17. So a morph happened! The board changed when I cleared the greens.
+Wait, let me reconsider. The sky went from 857 to 1438 (increased), and the greens went from 14 to 17 (increased). So the board morphed.
+Actually, wait. The "TERMINAL after clear 33 27" message was misleading. The `term` variable was set based on `last_action_result.get('level_completed')`, which was False. But the board changed (sky 857→1438, greens 14→17). So a morph happened.
+Let me reconsider. The board morphed when I cleared the greens. So the morph is triggered by clearing the greens, not by moving the char.
+Wait, but in level 1, the morphs happened when I moved the char. Let me reconsider.
+Actually, in level 1, I cleared the greens AND moved the char. The morphs might have been triggered by either.
+Let me reconsider. In level 2, I cleared 8 greens (rows 27 cols 15,21,27,33,39,45,51 and row 33 col 15), and the board morphed (sky 857→1438, greens 14→17).
+So the morph happened after clearing some greens. Let me look at the new board.
+Actually, the greens went from 14 to 17. So 3 more greens appeared. And the sky increased. So the board changed.
+Let me look at the new board layout.
+Wait, but I only cleared 8 greens (out of 14). So 6 greens should remain. But the board shows 17 greens. So the board morphed and added more greens.
+Let me look at the new board.
+Actually, let me reconsider. The morph might have happened because I cleared a specific green (the one at row 33, col 27). Or it might have happened after clearing a certain number of greens.
+Let me look at the new board layout and understand what changed.
+Let me get the new layout.
+Actually, let me reconsider the whole game structure. Maybe the morph is triggered by clearing all the greens in a row, or clearing a specific green.
+Let me look at the new board.
+Let me get the S/B/N/Y nodes and the char position.
+[ASSISTANT TOOL CALL: python]
+id: chatcmpl-tool-8f58728e2bb36ca2
+<tool_call>
+<function=python>
+<parameter=code>
+seg=current_frame.segmentation
+print("LEVEL2 post-morph nodes:")
+for n in seg['nodes']:
+    if n['color'] in ('S','B','N','M','P','Y'):
+        bb=n['boundary']; print("  ",n['color'],n['pixels'],(min(p[0] for p in bb),max(p[0] for p in bb),min(p[1] for p in bb),max(p[1] for p in bb)))
+print("GREEN count:",sum(1 for n in seg['nodes'] if n['color']=='N'))
+for n in seg['nodes']:
+    if n['color']=='b':
+        bb=n['boundary']; print("CHAR box:",(min(p[0] for p in bb),max(p[0] for p in bb),min(p[1] for p in bb),max(p[1] for p in bb)))
+# compare to previous frame
+ps=previous_frame.segmentation
+print("PREV sky:",sum(n['pixels'] for n in ps['nodes'] if n['color']=='S'),"greens:",sum(1 for n in ps['nodes'] if n['color']=='N'))
+</parameter>
+</function>
+</tool_call>
+
+[TOOL RESULT: chatcmpl-tool-8f58728e2bb36ca2]
+LEVEL2 post-morph nodes:
+   B 1844 (0, 62, 0, 63)
+   S 408 (0, 23, 37, 53)
+   S 199 (7, 23, 13, 29)
+   Y 1 (11, 11, 14, 14)
+   Y 1 (11, 11, 16, 16)
+   Y 1 (11, 11, 20, 20)
+   Y 1 (11, 11, 22, 22)
+   Y 1 (11, 11, 26, 26)
+   Y 1 (11, 11, 28, 28)
+   N 21 (25, 29, 13, 17)
+   N 21 (25, 29, 19, 23)
+   N 21 (25, 29, 25, 29)
+   N 21 (25, 29, 31, 35)
+   N 21 (25, 29, 37, 41)
+   N 21 (25, 29, 43, 47)
+   N 21 (25, 29, 49, 53)
+   N 21 (31, 35, 13, 17)
+   N 21 (31, 35, 19, 23)
+   N 21 (31, 35, 25, 29)
+   N 21 (31, 35, 31, 35)
+   N 21 (31, 35, 37, 41)
+   N 21 (31, 35, 43, 47)
+   N 21 (31, 35, 49, 53)
+   S 1043 (37, 62, 13, 53)
+   Y 2 (38, 39, 22, 22)
+GREEN count: 14
+CHAR box: (37, 40, 20, 21)
+PREV sky: 1438 greens: 17
+
+[USER]
+The code executed 8 actions in the previous sequence.
+Executed actions: ACTION6(row=27, col=15), ACTION6(row=27, col=21), ACTION6(row=27, col=27), ACTION6(row=27, col=33), ACTION6(row=27, col=39), ACTION6(row=27, col=45), ACTION6(row=27, col=51), ACTION6(row=33, col=15).
+You are still on the same level.
+Current state: step 50, level 2.
+Valid actions right now: ACTION3, ACTION4, ACTION6, ACTION7.
+Only tool: `python`. It receives `current_frame`, `previous_frame`, `history`, `transitions`, `last_transition`, `valid_actions`, `last_action_result`, `runtime_memory`, `telemetry`, `ledger`, `ledger_validation`, `execution_ledger`, `world_model_ledger`, `verification_ledger`, `coverage_ledger`, `memory`, `dynamics`, `continuity`, `hypotheses`, `level_transition`, `last_action_in_valid_action`, `record_hypothesis(...)`, and `action(actions)`.
+Only letter-coded board views and lightweight metadata are exposed; raw numeric color IDs are not available.
+Keep tool output compact: use `current_frame.segmentation` as the primary view, and `current_frame.ascii` only for a small specific region; never print full boards.
+For the most recent change, compare `previous_frame` to `current_frame`, or `last_transition.before_frame` to `last_transition.after_frame`; `history[-1].frame` is the current frame, not the previous one.
+Use Python to inspect the evidence, refine that world model from the newest history, and search or score candidate actions or short sequences against the current goal as you currently understand it.
+Use the structured ledger for authoritative facts and evidence: action meanings are learned per game by default, while availability, target, and preconditions can vary by level or state. Interface hints are priors, not facts.
+Treat `last_action_result`, `execution_ledger`, and `runtime_memory.telemetry` as authoritative transition evidence. Distinguish not-advertised, adapter/parameter/engine failure, executed no-observable-change, observable change, task progress, and terminal failure.
+Model combinations as causal action sequences, not labels: write target Y, prerequisite state X, action order, expected transition after each step, and evidence. A step can be useful preparation even when it gives no immediate reward. Reuse tested sequences only in matching state context; reject unchanged retries that previously failed.
+For each action object, include the immediate test hypothesis and target-object presence claim when known; the target may be possible, unknown, or absent in this level. Keep reusable mechanics in record_hypothesis(...).
+Free-text working notes below are optional and non-authoritative; revise them when useful, while recording testable claims and observable predictions in `record_hypothesis(...)`.
+You may call `action(actions)` more than once in one Python snippet if your search or control loop needs it, but stop immediately if a result reports `game_over`, `run_complete`, `level_completed`, or `done`.
+end of optional working notes. 
+Focus on what changed most recently in `history`, update the target environment change if needed, and separate gameplay-object changes from HUD-only changes.
+When ready, call `action(actions)` from inside the `python` tool with the best valid action or ordered batch selected by your code. If your code has found a reliable short sequence, prefer batching it in one call.
+You may call `action(actions)` more than once in one Python snippet if your search or control loop needs it.
+If you include assistant text before a tool call, keep it short and use it to update the world model. Helpful optional prefixes are `World model:`, `Goal model:`, `Action model:`, `Recent findings:`, `Open questions:`, `Plan:`, and `Cross-level notes:`.
+When calling `python`, emit exactly the tool-call format shown elsewhere in this prompt for this model. Use only that format; do not add markdown fences, prose wrappers, or alternate tool-call syntax. Do not quote or place tool-call markup inside explanatory text; when you decide to call the tool, emit the tool call itself.
+If you use ACTION6, include integer row and col arguments.
+Structured continuity recall (fact/evidence IDs only; inspect the Ledger for details):
+{"active_belief_ids":["H51","H52","H53","H54","H55","H56","H57","H58","H59","H60","H61"],"contested_belief_ids":[],"current_plan":{},"level":2,"mechanic_ids":[],"memory":"ledger-backed","objective":"complete_level","recent_evidence_ids":["T42","T43","T44","T45","T46","T47","T48","T52"],"unknown_ids":[]}
+{"active_belief_ids":["H51","H52","H53","H54","H55","H56","H57","H58","H59","H60","H61"],"avoid_sequence_ids":["S27","S28","S29","S30","S31","S32","S33","S34","S35","S36","S37","S38"],"boundary":"context_rollover","contested_belief_ids":[],"current_state_ref":"T52","game_id":"bp35-0a0ad940","level":2,"objective":"complete_game","plan":{},"recent_evidence_ids":["T40","T41","T42","T43","T44","T45","T46","T47","T48","T52"],"scene_graph_ref":null,"unknown_ids":[]}
+End structured continuity recall.
+Current grid image:
+
+[ASSISTANT]
+The board morphed back to the 14-green layout (previous frame had 17 greens/sky 1438, now 14 greens/sky 1650). The morph is tied to clearing greens. Let me clear greens one at a time, **recomputing centers after each** (since the board can morph), and watch for morph/completion.
+[REASONING]
+Wait, this is confusing. The current frame shows 14 greens (same as before), and the previous frame shows 17 greens. So the board went FROM 17 greens TO 14 greens. That means the morph happened in the opposite direction from what I thought.
+Wait, let me reconsider. The `previous_frame` is the frame before the most recent real environment action. The most recent action was `ACTION6(row=33, col=15)`. So `previous_frame` is the frame before that action, and `current_frame` is the frame after.
+So before the last action (ACTION6 row=33 col=15), the board had 17 greens and sky 1438. After the last action, the board has 14 greens and sky 1043+408+199=1650.
+Wait, that doesn't make sense. Let me reconsider.
+Actually, the `previous_frame` is the frame before the most recent action. The most recent action was ACTION6(row=33, col=15). So `previous_frame` is the state before that action, and `current_frame` is the state after.
+So before ACTION6(row=33, col=15): sky 1438, greens 17.
+After ACTION6(row=33, col=15): sky 1650, greens 14.
+So clearing that green caused the board to change (morph). The sky increased (1438→1650) and the greens decreased (17→14).
+Wait, but that's weird. Clearing a green should decrease the greens by 1 (17→16), not 17→14. And the sky increased. So a morph happened.
+Hmm, let me reconsider. Maybe the board was in a different state than I thought. Let me look at the history more carefully.
+Actually, I think I misread the situation. Let me reconsider.
+In my previous code, I cleared 8 greens in a loop. After each clear, I checked for a morph. The loop printed "TERMINAL after clear 33 27" — wait, that was a bug in my code. The `term` variable was set based on `last_action_result.get('level_completed')`, which was False. But the loop continued.
+Wait, no. Let me re-read my code.
+```
+for (r,c) in green_centers(current_frame):
+    action([...])
+    if last_action_result.get('level_completed') or last_action_result.get('done') or last_action_result.get('game_over'):
+        print("TERMINAL after clear",r,c); break
+print("after clears: greens=",greens(current_frame),"sky=",sky_px(current_frame),"term=",last_action_result.get('level_completed'))
+```
+So the loop cleared greens until a terminal condition. But it printed "TERMINAL after clear 33 27", which means the loop broke after clearing (33, 27). But the `term` condition was `level_completed or done or game_over`. So one of those was True after clearing (33, 27).
+But then the final print showed `term=False` (level_completed=False). So the loop broke because of `done` or `game_over`, not `level_completed`.
+Wait, but the output showed "TERMINAL after clear 33 27" and then "after clears: greens= 17 sky= 1438 term= False". So the loop broke after clearing (33, 27), and the final state has 17 greens and sky 1438.
+But wait, the green centers I computed were from the initial frame (14 greens). The loop cleared them one by one. But the board morphed during the loop, so the green centers changed.
+Hmm, this is getting confusing. Let me reconsider.
+Actually, I think the issue is that the board morphed during the loop, and my loop was using stale green centers. Let me reconsider.
+The initial frame had 14 greens at specific positions. I computed the green centers from that frame. Then I cleared them one by one. But after some clears, the board morphed, and the green positions changed. So my loop was clearing the wrong positions.
+Let me reconsider the actual state. The current frame has 14 greens (same positions as the initial frame). The previous frame (before the last action) had 17 greens and sky 1438.
+So the board morphed at some point during the loop, and then morphed back? Or the board is in a different state now.
+Actually, let me reconsider. The current frame shows the SAME 14 greens as the initial frame (rows 25-29 and 31-35, cols 13-53). And the sky is 1650 (408+199+1043). So the board is back to the initial layout.
+Wait, but the previous frame had 17 greens and sky 1438. So the board was in a different state before the last action.
+Let me reconsider. Maybe the board morphed to a state with 17 greens, and then the last action (ACTION6 row=33 col=15) cleared a green and morphed back to 14 greens.
+This is confusing. Let me just look at the current state and continue.
+The current state has 14 greens (rows 25-29 and 31-35, cols 13-53), sky 1650, char at col 20-21.
+So the board is in the same layout as the initial level 2 frame. Let me continue clearing the greens.
+Actually, wait. Let me reconsider. The current frame shows 14 greens at the SAME positions as the initial frame. So the board is back to the initial layout. But I already cleared 8 greens (rows 27 cols 15,21,27,33,39,45,51 and row 33 col 15). So those greens should be gone.
+But the current frame shows 14 greens at the same positions. So the board must have morphed and restored the greens.
+This is very confusing. Let me just look at the current state and continue.
+Actually, let me reconsider the whole thing. Maybe the board morphs are triggered by clearing greens, and the morph changes the board layout (including the green positions). So when I clear a green, the board morphs, and the green positions change.
+Let me just look at the current state and continue clearing the greens. The current state has 14 greens at rows 25-29 and 31-35, cols 13-53. Let me clear them again.
+But wait, I already cleared some of them. If I clear them again, the board might morph again.
+Let me just clear the greens in the current frame and see what happens.
+Actually, let me reconsider. Maybe the morph is triggered by clearing a specific green (not any green). And the morph changes the board layout.
+Let me just clear the greens in the current frame and watch for a morph or completion.
+Let me write code to clear the greens in the current frame, one by one, and check for a morph or completion after each.
+Actually, let me reconsider. The current frame has 14 greens. Let me clear them all and see if the level completes.
+But I need to be careful about the morph. If the board morphs during the loop, the green positions change. So I should recompute the green centers after each clear.
+Let me write code to clear the greens, recomputing the centers after each clear, and check for a morph or completion.
+Actually, let me reconsider. The morph might be triggered by clearing a specific green. Let me just clear the greens one by one and watch for a morph.
+Let me write the code.
+[ASSISTANT TOOL CALL: python]
+id: chatcmpl-tool-ad6ebf4f000d8731
+<tool_call>
+<function=python>
+<parameter=code>
+def green_centers(f):
+    out=[]
+    for n in f.segmentation['nodes']:
+        if n['color']=='N':
+            bb=n['boundary']; out.append(((min(p[0] for p in bb)+max(p[0] for p in bb))//2,(min(p[1] for p in bb)+max(p[1] for p in bb))//2))
+    return sorted(out)
+def sky_px(f): return sum(n['pixels'] for n in f.segmentation['nodes'] if n['color']=='S')
+def greens(f): return sum(1 for n in f.segmentation['nodes'] if n['color']=='N')
+for i in range(20):
+    cs=green_centers(current_frame)
+    if not cs: print("no greens left"); break
+    r,c=cs[0]
+    s0=sky_px(current_frame); g0=greens(current_frame)
+    action([{'action':'ACTION6','row':r,'col':c,'hypothesis':{'claim':'clear green (may morph)','expected_gameplay_change':True,'confidence':0.6},'target_object':{'description':'green','presence':'present'}}])
+    s1=sky_px(current_frame); g1=greens(current_frame)
+    term = last_action_result.get('level_completed') or last_action_result.get('done') or last_action_result.get('game_over')
+    print(f"#{i+1} clear({r},{c}) sky {s0}->{s1} g {g0}->{g1} MORPH={s1!=s0} term={term}")
+    if term:
+        print("STOP:",{k:last_action_result.get(k) for k in ('board_changed','level_completed','done','game_over','reward')}); break
+</parameter>
+</function>
+</tool_call>
+
+[TOOL RESULT: chatcmpl-tool-ad6ebf4f000d8731]
+Tool timed out after 30s
+
+[USER]
+The code executed 8 actions in the previous sequence.
+Executed actions: ACTION6(row=27, col=15), ACTION6(row=27, col=21), ACTION6(row=27, col=27), ACTION6(row=27, col=33), ACTION6(row=27, col=39), ACTION6(row=27, col=45), ACTION6(row=27, col=51), ACTION6(row=33, col=15).
+You are still on the same level.
+Current state: step 58, level 2.
+Valid actions right now: ACTION3, ACTION4, ACTION6, ACTION7.
+Only tool: `python`. It receives `current_frame`, `previous_frame`, `history`, `transitions`, `last_transition`, `valid_actions`, `last_action_result`, `runtime_memory`, `telemetry`, `ledger`, `ledger_validation`, `execution_ledger`, `world_model_ledger`, `verification_ledger`, `coverage_ledger`, `memory`, `dynamics`, `continuity`, `hypotheses`, `level_transition`, `last_action_in_valid_action`, `record_hypothesis(...)`, and `action(actions)`.
+Only letter-coded board views and lightweight metadata are exposed; raw numeric color IDs are not available.
+Keep tool output compact: use `current_frame.segmentation` as the primary view, and `current_frame.ascii` only for a small specific region; never print full boards.
+For the most recent change, compare `previous_frame` to `current_frame`, or `last_transition.before_frame` to `last_transition.after_frame`; `history[-1].frame` is the current frame, not the previous one.
+Use Python to inspect the evidence, refine that world model from the newest history, and search or score candidate actions or short sequences against the current goal as you currently understand it.
+Use the structured ledger for authoritative facts and evidence: action meanings are learned per game by default, while availability, target, and preconditions can vary by level or state. Interface hints are priors, not facts.
+Treat `last_action_result`, `execution_ledger`, and `runtime_memory.telemetry` as authoritative transition evidence. Distinguish not-advertised, adapter/parameter/engine failure, executed no-observable-change, observable change, task progress, and terminal failure.
+Model combinations as causal action sequences, not labels: write target Y, prerequisite state X, action order, expected transition after each step, and evidence. A step can be useful preparation even when it gives no immediate reward. Reuse tested sequences only in matching state context; reject unchanged retries that previously failed.
+For each action object, include the immediate test hypothesis and target-object presence claim when known; the target may be possible, unknown, or absent in this level. Keep reusable mechanics in record_hypothesis(...).
+Free-text working notes below are optional and non-authoritative; revise them when useful, while recording testable claims and observable predictions in `record_hypothesis(...)`.
+You may call `action(actions)` more than once in one Python snippet if your search or control loop needs it, but stop immediately if a result reports `game_over`, `run_complete`, `level_completed`, or `done`.
+end of optional working notes. 
+Focus on what changed most recently in `history`, update the target environment change if needed, and separate gameplay-object changes from HUD-only changes.
+When ready, call `action(actions)` from inside the `python` tool with the best valid action or ordered batch selected by your code. If your code has found a reliable short sequence, prefer batching it in one call.
+You may call `action(actions)` more than once in one Python snippet if your search or control loop needs it.
+If you include assistant text before a tool call, keep it short and use it to update the world model. Helpful optional prefixes are `World model:`, `Goal model:`, `Action model:`, `Recent findings:`, `Open questions:`, `Plan:`, and `Cross-level notes:`.
+When calling `python`, emit exactly the tool-call format shown elsewhere in this prompt for this model. Use only that format; do not add markdown fences, prose wrappers, or alternate tool-call syntax. Do not quote or place tool-call markup inside explanatory text; when you decide to call the tool, emit the tool call itself.
+If you use ACTION6, include integer row and col arguments.
+Structured continuity recall (fact/evidence IDs only; inspect the Ledger for details):
+{"active_belief_ids":["H58","H59","H60","H61","H62","H63","H64","H65","H66","H67","H68","H69"],"contested_belief_ids":[],"current_plan":{},"level":2,"mechanic_ids":[],"memory":"ledger-backed","objective":"complete_level","recent_evidence_ids":["T53","T54","T55","T56","T57","T58","T59","T60"],"unknown_ids":[]}
+{"active_belief_ids":["H51","H52","H53","H54","H55","H56","H57","H58","H59","H60","H61"],"avoid_sequence_ids":["S27","S28","S29","S30","S31","S32","S33","S34","S35","S36","S37","S38"],"boundary":"context_rollover","contested_belief_ids":[],"current_state_ref":"T52","game_id":"bp35-0a0ad940","level":2,"objective":"complete_game","plan":{},"recent_evidence_ids":["T40","T41","T42","T43","T44","T45","T46","T47","T48","T52"],"scene_graph_ref":null,"unknown_ids":[]}
+End structured continuity recall.
+Current grid image:
+
+[ASSISTANT]
+The board morphed to a **1-row** green layout (7 greens, rows 25–29), bottom sky expanded to rows 31–62, char still at col 20–21. Let me map it precisely and continue clearing.
+[REASONING]
+The board changed significantly. Now there's only 1 row of greens (7 greens), and the top sky has a different shape (the top-left sky is now bigger, with a notch). The char is still at col 20-21.
+The previous frame (before the last action) had the 2-row green layout. The current frame has 1 row of greens (7 greens).
+So the board morphed from 2 rows to 1 row of greens.
+Let me look at the current layout.
+From the image:
+- Top sky: rows 0-23, cols 13-53 (but with a notch at rows 14-23, cols 30-36).
+- 1 row of greens: rows 25-29, cols 13-53 (7 greens).
+- Bottom sky: rows 31-62, cols 13-53.
+- Char at rows 31-34, cols 20-21.
+- 6 Y dots in the top-left sky (row 11).
+So the board morphed from 2 rows of greens to 1 row of greens. The bottom sky expanded (rows 31-62 instead of 37-62).
+Let me get the exact layout.
+Actually, the timeout happened because my loop was running too many actions. Let me just look at the current state and continue.
+Let me get the current layout.
+[ASSISTANT TOOL CALL: python]
+id: chatcmpl-tool-b03c4536b7b8d8b7
+<tool_call>
+<function=python>
+<parameter=code>
+seg=current_frame.segmentation
+print("LEVEL2 current nodes:")
+for n in seg['nodes']:
+    if n['color'] in ('S','N','Y','P','M'):
+        bb=n['boundary']; print("  ",n['color'],n['pixels'],(min(p[0] for p in bb),max(p[0] for p in bb),min(p[1] for p in bb),max(p[1] for p in bb)))
+print("GREEN count:",sum(1 for n in seg['nodes'] if n['color']=='N'))
+for n in seg['nodes']:
+    if n['color']=='b':
+        bb=n['boundary']; print("CHAR box:",(min(p[0] for p in bb),max(p[0] for p in bb),min(p[1] for p in bb),max(p[1] for p in bb)))
+print("last result:",{k:last_action_result.get(k) for k in ('board_changed','level_completed','done','game_over','reward')})
+</parameter>
+</function>
+</tool_call>
+
+[TOOL RESULT: chatcmpl-tool-b03c4536b7b8d8b7]
+LEVEL2 current nodes:
+   S 1924 (0, 62, 13, 53)
+   Y 1 (11, 11, 14, 14)
+   Y 1 (11, 11, 16, 16)
+   Y 1 (11, 11, 20, 20)
+   Y 1 (11, 11, 22, 22)
+   Y 1 (11, 11, 26, 26)
+   Y 1 (11, 11, 28, 28)
+   N 21 (31, 35, 19, 23)
+   N 21 (31, 35, 25, 29)
+   N 21 (31, 35, 31, 35)
+   N 21 (31, 35, 37, 41)
+   N 21 (31, 35, 43, 47)
+   N 21 (31, 35, 49, 53)
+   Y 2 (38, 39, 22, 22)
+GREEN count: 6
+CHAR box: (37, 40, 20, 21)
+last result: {'board_changed': True, 'level_completed': False, 'done': False, 'game_over': False, 'reward': 0.0}
+
+[ASSISTANT]
+Now a single connected sky with **6 greens** in one row (rows 31–35, cols 19–53), char at col 20–21 just below, Y-2px at col 22. Let me clear greens one at a time (recomputing centers each step, limited to 3 actions to avoid timeout).
+[REASONING]
+Now the board has:
+- 1 big sky (S 1924): rows 0-62, cols 13-53. So the top and bottom sky are now connected (the green row is in the middle).
+- 6 greens (N): rows 31-35, cols 19-53. So 6 greens in 1 row.
+- 6 Y dots in the top (row 11).
+- 1 Y 2px at rows 38-39, col 22.
+- Char at rows 37-40, cols 20-21.
+So the board morphed to a single sky with a row of 6 greens in the middle. The char is below the greens (rows 37-40), and the Y 2px is at rows 38-39, col 22 (right next to the char).
+So now the char is in the same sky as the Y 2px. The char is at col 20-21, and the Y 2px is at col 22. So the char is right next to the Y 2px.
+Wait, but there are 6 greens above the char. Let me clear them.
+Actually, let me reconsider. The board has 6 greens in 1 row (rows 31-35, cols 19-53). The char is at rows 37-40, cols 20-21. So the greens are above the char.
+Let me clear the 6 greens.
+The green centers are at row 33, cols 21, 27, 33, 39, 45, 51.
+Let me clear them.
+But I need to be careful about the morph. If the board morphs during the loop, the green positions change. So I should recompute the green centers after each clear.
+Let me clear the 6 greens, one by one, and check for a morph or completion.
+Actually, let me reconsider. The morph happened after clearing some greens. Let me just clear the greens one by one and watch.
+Let me write code to clear the greens, recomputing the centers after each clear, and check for a morph or completion. But I need to be careful about the timeout. Let me limit the loop to 6 iterations (the number of greens).
+Actually, the timeout happened because the loop was running too many actions (each action takes time). Let me limit the loop to a few actions.
+Let me clear the 6 greens, one by one, and check for a morph or completion.
+Wait, but the timeout was 30 seconds for the whole Python snippet. Each action takes some time. If I do 6 actions, it might take 6 * (time per action) seconds. If each action takes 5 seconds, that's 30 seconds. So I should limit the loop to a few actions.
+Let me do 3 actions per snippet to be safe.
+Actually, let me reconsider. The previous snippet did 8 actions and timed out at 30 seconds. So each action takes about 3-4 seconds. Let me do 3-4 actions per snippet.
+Let me clear 3 greens in this snippet.
+Actually, let me reconsider. The greens are at row 33, cols 21, 27, 33, 39, 45, 51. Let me clear the first 3.
+But I need to recompute the centers after each clear (in case of a morph).
+Let me write the code.
+[ASSISTANT TOOL CALL: python]
+id: chatcmpl-tool-82e972ff2fa74466
+<tool_call>
+<function=python>
+<parameter=code>
+def green_centers(f):
+    out=[]
+    for n in f.segmentation['nodes']:
+        if n['color']=='N':
+            bb=n['boundary']; out.append(((min(p[0] for p in bb)+max(p[0] for p in bb))//2,(min(p[1] for p in bb)+max(p[1] for p in bb))//2))
+    return sorted(out)
+def sky_px(f): return sum(n['pixels'] for n in f.segmentation['nodes'] if n['color']=='S')
+def greens(f): return sum(1 for n in f.segmentation['nodes'] if n['color']=='N')
+for i in range(3):
+    cs=green_centers(current_frame)
+    if not cs: print("no greens left"); break
+    r,c=cs[0]
+    s0=sky_px(current_frame); g0=greens(current_frame)
+    action([{'action':'ACTION6','row':r,'col':c,'hypothesis':{'claim':'clear green (may morph)','expected_gameplay_change':True,'confidence':0.6},'target_object':{'description':'green','presence':'present'}}])
+    s1=sky_px(current_frame); g1=greens(current_frame)
+    term = last_action_result.get('level_completed') or last_action_result.get('done') or last_action_result.get('game_over')
+    print(f"#{i+1} clear({r},{c}) sky {s0}->{s1} g {g0}->{g1} MORPH={s1!=s0} term={term}")
+    if term:
+        print("STOP:",{k:last_action_result.get(k) for k in ('board_changed','level_completed','done','game_over','reward')}); break
+</parameter>
+</function>
+</tool_call>
+
+[TOOL RESULT: chatcmpl-tool-82e972ff2fa74466]
+#1 clear(33,21) sky 1924->1438 g 6->17 MORPH=True term=None
+#2 clear(9,15) sky 1438->1438 g 17->17 MORPH=False term=True
+STOP: {'board_changed': None, 'level_completed': False, 'done': False, 'game_over': True, 'reward': None}
+
+[USER]
+The code executed 8 actions in the previous sequence.
+Executed actions: ACTION6(row=27, col=15), ACTION6(row=27, col=21), ACTION6(row=27, col=27), ACTION6(row=27, col=33), ACTION6(row=27, col=39), ACTION6(row=27, col=45), ACTION6(row=27, col=51), ACTION6(row=33, col=15).
+You are still on the same level.
+Current state: step 60, level 2.
+Valid actions right now: ACTION3, ACTION4, ACTION6, ACTION7.
+Only tool: `python`. It receives `current_frame`, `previous_frame`, `history`, `transitions`, `last_transition`, `valid_actions`, `last_action_result`, `runtime_memory`, `telemetry`, `ledger`, `ledger_validation`, `execution_ledger`, `world_model_ledger`, `verification_ledger`, `coverage_ledger`, `memory`, `dynamics`, `continuity`, `hypotheses`, `level_transition`, `last_action_in_valid_action`, `record_hypothesis(...)`, and `action(actions)`.
+Only letter-coded board views and lightweight metadata are exposed; raw numeric color IDs are not available.
+Keep tool output compact: use `current_frame.segmentation` as the primary view, and `current_frame.ascii` only for a small specific region; never print full boards.
+For the most recent change, compare `previous_frame` to `current_frame`, or `last_transition.before_frame` to `last_transition.after_frame`; `history[-1].frame` is the current frame, not the previous one.
+Use Python to inspect the evidence, refine that world model from the newest history, and search or score candidate actions or short sequences against the current goal as you currently understand it.
+Use the structured ledger for authoritative facts and evidence: action meanings are learned per game by default, while availability, target, and preconditions can vary by level or state. Interface hints are priors, not facts.
+Treat `last_action_result`, `execution_ledger`, and `runtime_memory.telemetry` as authoritative transition evidence. Distinguish not-advertised, adapter/parameter/engine failure, executed no-observable-change, observable change, task progress, and terminal failure.
+Model combinations as causal action sequences, not labels: write target Y, prerequisite state X, action order, expected transition after each step, and evidence. A step can be useful preparation even when it gives no immediate reward. Reuse tested sequences only in matching state context; reject unchanged retries that previously failed.
+For each action object, include the immediate test hypothesis and target-object presence claim when known; the target may be possible, unknown, or absent in this level. Keep reusable mechanics in record_hypothesis(...).
+Free-text working notes below are optional and non-authoritative; revise them when useful, while recording testable claims and observable predictions in `record_hypothesis(...)`.
+You may call `action(actions)` more than once in one Python snippet if your search or control loop needs it, but stop immediately if a result reports `game_over`, `run_complete`, `level_completed`, or `done`.
+end of optional working notes. 
+Focus on what changed most recently in `history`, update the target environment change if needed, and separate gameplay-object changes from HUD-only changes.
+When ready, call `action(actions)` from inside the `python` tool with the best valid action or ordered batch selected by your code. If your code has found a reliable short sequence, prefer batching it in one call.
+You may call `action(actions)` more than once in one Python snippet if your search or control loop needs it.
+If you include assistant text before a tool call, keep it short and use it to update the world model. Helpful optional prefixes are `World model:`, `Goal model:`, `Action model:`, `Recent findings:`, `Open questions:`, `Plan:`, and `Cross-level notes:`.
+When calling `python`, emit exactly the tool-call format shown elsewhere in this prompt for this model. Use only that format; do not add markdown fences, prose wrappers, or alternate tool-call syntax. Do not quote or place tool-call markup inside explanatory text; when you decide to call the tool, emit the tool call itself.
+If you use ACTION6, include integer row and col arguments.
+Structured continuity recall (fact/evidence IDs only; inspect the Ledger for details):
+{"active_belief_ids":["H61","H62","H63","H64","H65","H66","H67","H68","H69","H70","H71","H72"],"contested_belief_ids":[],"current_plan":{},"level":2,"mechanic_ids":[],"memory":"ledger-backed","objective":"complete_level","recent_evidence_ids":["T54","T55","T56","T57","T58","T59","T60","T64"],"unknown_ids":[]}
+{"active_belief_ids":["H60","H61","H62","H63","H64","H65","H66","H67","H68","H69","H70","H71"],"avoid_sequence_ids":["S37","S38","S39","S40","S41","S42","S43","S44","S45","S46","S47","S48"],"boundary":"context_rollover","contested_belief_ids":[],"current_state_ref":"T60","game_id":"bp35-0a0ad940","level":2,"objective":"complete_game","plan":{},"recent_evidence_ids":["T46","T47","T48","T52","T53","T54","T55","T56","T57","T58","T59","T60"],"scene_graph_ref":null,"unknown_ids":[]}
+End structured continuity recall.
+Current grid image:
+
+[ASSISTANT]
+**Game over** (`game_over: True`) after clearing (9,15) — my stale-center loop hit a morphed board and cleared a wrong cell. Stopping and re-grounding. Let me inspect what the final state and the fatal transition were (no actions).
+[REASONING]
+The game is over! `game_over: True`. So I lost the game.
+Let me reconsider what happened. The board morphed, and then I cleared a green at (9, 15) — but wait, (9, 15) is in the top sky, not a green. So my code cleared the wrong position (it was using stale green centers).
+Actually, the issue is that the board morphed after the first clear (sky 1924→1438, g 6→17). So the board went back to the 2-row green layout (17 greens). Then my code tried to clear (9, 15), which is in the top sky (not a green). So it cleared the wrong position, and the game ended.
+Wait, but (9, 15) is not a green. So why did my code try to clear it? Because after the morph, the green centers changed, and my code recomputed them. But the morphed board had 17 greens, and the first green center was (9, 15)? That doesn't make sense.
+Actually, let me reconsider. The morphed board (17 greens) might have had a green at (9, 15). But that's in the top sky. So the morphed board had a green in the top sky.
+Hmm, this is confusing. Let me reconsider.
+Actually, the game is over. So I lost. Let me reconsider the whole strategy.
+The issue is that the board morphs unpredictably, and my code was using stale green centers. So I cleared the wrong positions, and the game ended.
+Let me reconsider the game structure. Maybe the morphs are triggered by clearing specific greens, and the morph changes the board layout. And if I clear the wrong green, the game ends.
+Actually, let me reconsider. The game ended after I cleared (9, 15). But (9, 15) is in the top sky. So maybe I cleared a Y dot or something, and that ended the game.
+Wait, the Y dots are at row 11, cols 14, 16, 20, 22, 26, 28. So (9, 15) is not a Y dot. It's just sky.
+So clearing (9, 15) (sky) ended the game. That's strange.
+Actually, let me reconsider. Maybe the game ended because of the morph, not because of the clear. The morph might have triggered a game-over condition.
+Or maybe the game ended because I cleared too many greens, or cleared a green in the wrong order.
+Let me reconsider the whole game structure. This is getting too complex. Let me just accept that the game is over and move on.
+Actually, wait. The game is over, but I'm still on level 2. So maybe the game over is a temporary state, and I can continue.
+Let me check the current state.
+Actually, the `game_over: True` means the game is over. So I lost. Let me just stop and re-ground.
+But wait, the prompt says "If an action result reports game_over, run_complete, level_completed, or done, stop acting immediately and re-ground on the next turn."
+So I should stop acting and re-ground on the next turn.
+Let me just stop and wait for the next turn.
+Actually, let me reconsider. The game might not be truly over. The `game_over: True` might be a transient state. Let me check the current frame.
+Actually, let me just stop and re-ground. I'll inspect the current state on the next turn.
+Wait, but I should at least understand what happened. Let me inspect the current frame and the last transition.
+Actually, the prompt says to stop acting immediately. So let me just inspect the current state (without acting) and re-ground.
+Let me inspect the current frame.
+[ASSISTANT TOOL CALL: python]
+id: chatcmpl-tool-88d11f58c0fc0360
+<tool_call>
+<function=python>
+<parameter=code>
+print("LAST ACTION:", last_action)
+print("last result:", {k:last_action_result.get(k) for k in ('board_changed','level_completed','done','game_over','run_complete','reward','valid_actions')})
+seg=current_frame.segmentation
+print("current nodes (S/N/Y/P/M/b):")
+for n in seg['nodes']:
+    if n['color'] in ('S','N','Y','P','M','b'):
+        bb=n['boundary']; print("  ",n['color'],n['pixels'],(min(p[0] for p in bb),max(p[0] for p in bb),min(p[1] for p in bb),max(p[1] for p in bb)))
+# last transition before/after
+if last_transition:
+    bs=last_transition.before_frame.segmentation; as_=last_transition.after_frame.segmentation
+    print("BEFORE: sky",sum(n['pixels'] for n in bs['nodes'] if n['color']=='S'),"g",sum(1 for n in bs['nodes'] if n['color']=='N'))
+    print("AFTER:  sky",sum(n['pixels'] for n in as_['nodes'] if n['color']=='S'),"g",sum(1 for n in as_['nodes'] if n['color']=='N'))
+    print("action:",last_transition.action)
+</parameter>
+</function>
+</tool_call>
+
+[TOOL RESULT: chatcmpl-tool-88d11f58c0fc0360]
+LAST ACTION: RESET
+last result: {'board_changed': None, 'level_completed': False, 'done': False, 'game_over': True, 'run_complete': False, 'reward': None, 'valid_actions': []}
+current nodes (S/N/Y/P/M/b):
+   S 408 (0, 23, 37, 53)
+   S 199 (7, 23, 13, 29)
+   Y 1 (11, 11, 14, 14)
+   Y 1 (11, 11, 16, 16)
+   Y 1 (11, 11, 20, 20)
+   Y 1 (11, 11, 22, 22)
+   Y 1 (11, 11, 26, 26)
+   Y 1 (11, 11, 28, 28)
+   N 21 (25, 29, 13, 17)
+   N 21 (25, 29, 19, 23)
+   N 21 (25, 29, 25, 29)
+   N 21 (25, 29, 31, 35)
+   N 21 (25, 29, 37, 41)
+   N 21 (25, 29, 43, 47)
+   N 21 (25, 29, 49, 53)
+   N 21 (31, 35, 13, 17)
+   N 21 (31, 35, 19, 23)
+   N 21 (31, 35, 25, 29)
+   N 21 (31, 35, 31, 35)
+   N 21 (31, 35, 37, 41)
+   N 21 (31, 35, 43, 47)
+   N 21 (31, 35, 49, 53)
+   S 1043 (37, 62, 13, 53)
+   b 6 (37, 40, 20, 21)
+   Y 2 (38, 39, 22, 22)
+BEFORE: sky 1438 g 17
+AFTER:  sky 1650 g 14
+action: RESET
+
+[USER]
+The code executed 8 actions in the previous sequence.
+Executed actions: ACTION6(row=27, col=15), ACTION6(row=27, col=21), ACTION6(row=27, col=27), ACTION6(row=27, col=33), ACTION6(row=27, col=39), ACTION6(row=27, col=45), ACTION6(row=27, col=51), ACTION6(row=33, col=15).
+You are still on the same level.
+Current state: step 60, level 2.
+Valid actions right now: ACTION3, ACTION4, ACTION6, ACTION7.
+Only tool: `python`. It receives `current_frame`, `previous_frame`, `history`, `transitions`, `last_transition`, `valid_actions`, `last_action_result`, `runtime_memory`, `telemetry`, `ledger`, `ledger_validation`, `execution_ledger`, `world_model_ledger`, `verification_ledger`, `coverage_ledger`, `memory`, `dynamics`, `continuity`, `hypotheses`, `level_transition`, `last_action_in_valid_action`, `record_hypothesis(...)`, and `action(actions)`.
+Only letter-coded board views and lightweight metadata are exposed; raw numeric color IDs are not available.
+Keep tool output compact: use `current_frame.segmentation` as the primary view, and `current_frame.ascii` only for a small specific region; never print full boards.
+For the most recent change, compare `previous_frame` to `current_frame`, or `last_transition.before_frame` to `last_transition.after_frame`; `history[-1].frame` is the current frame, not the previous one.
+Use Python to inspect the evidence, refine that world model from the newest history, and search or score candidate actions or short sequences against the current goal as you currently understand it.
+Use the structured ledger for authoritative facts and evidence: action meanings are learned per game by default, while availability, target, and preconditions can vary by level or state. Interface hints are priors, not facts.
+Treat `last_action_result`, `execution_ledger`, and `runtime_memory.telemetry` as authoritative transition evidence. Distinguish not-advertised, adapter/parameter/engine failure, executed no-observable-change, observable change, task progress, and terminal failure.
+Model combinations as causal action sequences, not labels: write target Y, prerequisite state X, action order, expected transition after each step, and evidence. A step can be useful preparation even when it gives no immediate reward. Reuse tested sequences only in matching state context; reject unchanged retries that previously failed.
+For each action object, include the immediate test hypothesis and target-object presence claim when known; the target may be possible, unknown, or absent in this level. Keep reusable mechanics in record_hypothesis(...).
+Free-text working notes below are optional and non-authoritative; revise them when useful, while recording testable claims and observable predictions in `record_hypothesis(...)`.
+You may call `action(actions)` more than once in one Python snippet if your search or control loop needs it, but stop immediately if a result reports `game_over`, `run_complete`, `level_completed`, or `done`.
+end of optional working notes. 
+Focus on what changed most recently in `history`, update the target environment change if needed, and separate gameplay-object changes from HUD-only changes.
+When ready, call `action(actions)` from inside the `python` tool with the best valid action or ordered batch selected by your code. If your code has found a reliable short sequence, prefer batching it in one call.
+You may call `action(actions)` more than once in one Python snippet if your search or control loop needs it.
+If you include assistant text before a tool call, keep it short and use it to update the world model. Helpful optional prefixes are `World model:`, `Goal model:`, `Action model:`, `Recent findings:`, `Open questions:`, `Plan:`, and `Cross-level notes:`.
+When calling `python`, emit exactly the tool-call format shown elsewhere in this prompt for this model. Use only that format; do not add markdown fences, prose wrappers, or alternate tool-call syntax. Do not quote or place tool-call markup inside explanatory text; when you decide to call the tool, emit the tool call itself.
+If you use ACTION6, include integer row and col arguments.
+Structured continuity recall (fact/evidence IDs only; inspect the Ledger for details):
+{"active_belief_ids":["H61","H62","H63","H64","H65","H66","H67","H68","H69","H70","H71","H72"],"contested_belief_ids":[],"current_plan":{},"level":2,"mechanic_ids":[],"memory":"ledger-backed","objective":"complete_level","recent_evidence_ids":["T54","T55","T56","T57","T58","T59","T60","T64"],"unknown_ids":[]}
+{"active_belief_ids":["H61","H62","H63","H64","H65","H66","H67","H68","H69","H70","H71","H72"],"avoid_sequence_ids":["S38","S39","S40","S41","S42","S43","S44","S45","S46","S47","S48","S49"],"boundary":"context_rollover","contested_belief_ids":[],"current_state_ref":"T64","game_id":"bp35-0a0ad940","level":2,"objective":"complete_game","plan":{},"recent_evidence_ids":["T47","T48","T52","T53","T54","T55","T56","T57","T58","T59","T60","T64"],"scene_graph_ref":null,"unknown_ids":[]}
+End structured continuity recall.
+Current grid image:
+
+[TURN TRANSCRIPT SO FAR]
+--- analysis_step=19 | action=60 | 22:14:30 | tool-agent ---
+[SYSTEM PROMPT]
+You are a coding agent solving a grid-based puzzle game.
+
+Game overview:
+- You are solving a multi-level grid puzzle game. 
+- You are called repeatedly over the course of a run. Treat each turn as one observe-plan-act cycle: re-understand the current state from the newest frame, update your working world model in Python, choose the next best action or short sequence against the goal as currently understood, execute it, and expect to re-evaluate on the next turn from the updated state.
+- Your job is to solve the entire game by clearing every level, not just the current screen.
+- An action's learned meaning normally persists across levels of the same game. Availability, target, and preconditions may still vary by level; create a level-specific semantic override only after contradictory evidence.
+- Across different games, learned action meanings reset to hypotheses; only the standardized interface contract transfers.
+- Optimize for as few in-game actions as possible while still being reliable.
+- In this environment, boards are presented as 64 x 64 color grids rendered with ARC color symbols.
+- Color legend: W=white, w=light gray, g=gray, G=dark gray, c=charcoal, B=black, M=magenta, P=pink, R=red, b=blue, S=sky blue, Y=yellow, O=orange, r=dark red, N=light green, p=purple.
+
+
+Runtime variables inside every `python` tool call:
+- `current_frame` is a lightweight frame view for the latest environment state.
+- `current_frame` exposes only `.ascii`, `.step`, `.level`, `.shape`, and `.segmentation`.
+- `current_frame.ascii` is a single newline-delimited string containing the latest board rendered with the letter-coded ARC color symbols.
+- `current_frame.segmentation` parses the board into objects. It returns `{'nodes': [...], 'adjacency_list': [...]}`.
+- Each node in `segmentation['nodes']` is one 4-connected same-color object with: `id` (index, ordered top-most-left-most), `color` (ARC color character), `hash` (a signature of the object's color and shape that ignores its position -- equal hashes mean the same object regardless of where it is, so use it to track an object across frames or to spot multiple identical objects in one frame), `pixels` (cell count), `boundary` (clockwise outer-perimeter corner points as `[row, col]`), and `children` (ids of objects fully enclosed by this one).
+- `segmentation['adjacency_list']` is a list of `[i, j]` node-id pairs whose objects share an edge.
+- `current_frame.step` is the current environment step count.
+- `current_frame.level` is the current level number.
+- `current_frame.shape` is a `(rows, cols)` tuple.
+- The raw numeric grid is intentionally not exposed. Use `current_frame.segmentation` as your primary view of the board -- objects, colors, shapes, containment, adjacency, and cross-frame object hashes. Use `current_frame.ascii` only to read a small, specific region; do not scan the whole board with it.
+- `history` is a chronological list of action/frame snapshots.
+- `history` is a Python list of objects, not a dict.
+- Each history entry exposes only `.action` and `.frame`; entries are not subscriptable like `entry['action']`.
+- Each `history[i].frame` is the frame after `history[i].action`; each frame exposes only `.ascii`, `.step`, `.level`, `.shape`, and `.segmentation`.
+- Important history semantics: when `history` is non-empty, `history[-1].frame` is the same latest/post-action board as `current_frame`. It is not the previous board. To inspect the state before the latest action, use `previous_frame` or `history[-2].frame` when available.
+- `previous_frame` is the frame before the most recent real environment action, or `None` if no previous frame is available.
+- `last_action` is the most recent real environment action name/display, or `None` before any real action.
+- `last_action_frame` is the post-action frame for `last_action`; it matches `current_frame` after a real action.
+- `transitions` is a chronological list of actual action transitions, excluding the initial seeded frame. Each transition exposes `.action`, `.before_frame`, `.after_frame`, `.frame` (alias of `.after_frame`), and `.result`.
+- `last_transition` is `transitions[-1]` or `None`. Its `.result` mirrors `last_action_result`; older transitions may have an empty `.result`. For before/after diffs, compare `last_transition.before_frame` to `last_transition.after_frame`; do not compare `current_frame` to `history[-1].frame`.
+- `last_action_result` is the persisted result dict from the most recent `action(...)` call. It remains available across later Python inspection calls that do not call `action(...)`, and is `{}` before any action result exists. Read transition metadata from fields/keys such as `last_action_result['board_changed']`, `last_action_result['done']`, `last_action_result['level_completed']`, `last_action_result['game_over']`, `last_action_result['run_complete']`, `last_action_result['reward']`, and `last_action_result['valid_actions']`.
+- `last_action_in_valid_action` reports whether the most recent action was legal under the valid-action list before it ran.
+- `telemetry` contains recent observation hashes, task/observable progress streaks, HUD/gameplay change classification, and changed-cell samples. An observation hash is not proof of complete latent-state identity.
+- `telemetry['task_no_progress_streak']` counts actions without engine task progress; `observable_no_change_streak` counts unchanged observations; `repeated_action_streak` counts identical displayed actions.
+- `level_transition` contains the last two frames and last five actions around the most recent level transition when one occurred.
+- `ledger` is the compact authoritative Inform view. `execution_ledger`, `world_model_ledger`, `verification_ledger`, and `coverage_ledger` expose its structured components; free prose is non-authoritative.
+- `ledger_validation` reports semantic-schema invariant failures without silently coercing or deleting evidence.
+- `hypotheses` contains structured candidates and predictions. Facts are separate from hypotheses, and unexecuted requests are never no-op evidence.
+- Record reusable claims with `record_hypothesis({...})` (alias `record_expectation`). Use a kind from `object_role`, `action_function`, `affordance`, `precondition`, or `completion_condition`; aliases are normalized but these canonical kinds produce the clearest world model.
+- Observable prediction fields include `state_changed`, `gameplay_changed`, `hud_changed`, `progress_changed`, `level_completed`, `run_complete`, and `object_changes.moved|added|removed|resized`. Unknown fields remain explicitly non-evaluable instead of becoming evidence.
+- Prefer an action object carrying its immediate hypothesis and possibly absent target, for example `{'action':'ACTION3','hypothesis':{'claim':'moves the bound object left','expected_gameplay_change':True,'confidence':0.4},'target_object':{'description':'candidate token','presence':'possible'}}`. Legacy strings remain accepted and receive only an implicit low-confidence intent.
+- A descriptive effect without an observable predicate is preserved but verifies as inconclusive, not supported or refuted.
+- `valid_actions` is the current list of advertised canonical action IDs. Not advertised, rejected, unexecuted, and executed-with-no-observable-change are distinct outcomes.
+- Call `action(actions)` to execute one or more real environment actions from Python.
+- Pass `action(actions)` a list like `['ACTION3']` or `[{'action': 'ACTION6', 'row': 4, 'col': 7}]`.
+- One action usually returns one frame, but a single action can result in a short multi-frame animation.
+- After `action(actions)` returns, `current_frame`, `previous_frame`, `history`, `transitions`, `valid_actions`, and `last_action_result` are refreshed.
+
+
+Multimodal context:
+- User turns include an attached image of the current ARC grid.
+- The image and `current_frame.ascii` are two representations of the same current frame.
+- You can use images and other tools to understand the game state and guide your strategy, each may be useful depending on the current uncertainty.
+
+
+Visual-game guidance:
+- Treat each board as a scene with objects, blockers, targets, adjacency, containment, motion, and symmetry.
+- Game entities are usually be rendered as connected multi-tile shapes such as 2×2, 2×3, 3×3, or longer patterned structures. Sometime they might also be 1x1 tokens.- Some games are logic or layout puzzles with no explicit player avatar or controllable sprite on the board. Do not assume a player exists; the relevant state may be an object, region, cursor, selector, or whole-board configuration.
+- Background colors are often white or gray/black-ish large regions, but not always. Verify background hypotheses by area, stability, and object boundaries rather than assuming them.
+- In many games, a long horizontal or vertical line near an edge is a timer or remaining-steps bar. It often shrinks or changes each step. If you identify such a bar, do not get distracted by it or treat it as core gameplay state unless there is concrete evidence that it interacts with the puzzle mechanics.
+A common failure mode is to mistake a segmented edge bar for clickable puzzle pieces. If a repeated strip of small blocks sits flush against the top, bottom, left, or right border and actions only change that strip while the interior board stays the same, classify it as HUD/timer state, not as an object to click through segment by segment. DON'T DO THIS!
+- Use coordinates only to target actions or describe local evidence. Do not frame the objective as reaching a specific absolute row or column.
+- Re-ground on the newest frame after any score increase or abrupt scene change; the returned board may already be the next level.
+- `WIN` means the whole game is solved. Mid-run level completion is more likely to appear as a score increase while play continues.
+- Strategies may transfer loosely across levels, but layouts and mechanics can change. Re-check the new board before repeating a plan.
+- `ACTION1`...`ACTION7` are canonical engine IDs, not semantic facts. Direction/interaction labels are interface priors only.
+- For coordinate action `ACTION6`, pass `row` and `col` integer arguments. `row` is vertical position, `col` is horizontal position.
+
+
+Python tool guidance:
+- Use `current_frame.segmentation` as your primary view of the board -- objects, colors, containment, adjacency, and cross-frame object hashes.
+- Use `current_frame.ascii` only to read a small, specific region of the board when `segmentation` is not enough; never use it to scan or summarize the whole board.
+- Every `python` tool call starts fresh. Re-import modules or re-define any custom utility logic you need.
+- The only importable standard-library modules are: bisect, collections, copy, fractions, functools, heapq, itertools, json, math, operator, random, re, statistics, string.
+- The only tool is `python`; call it with one ephemeral `code` string.
+- Always inspect `current_frame`, `history`, and `valid_actions` from Python instead of reasoning from the raw board by eye.
+- For the most recent change, compare `previous_frame` to `current_frame`, or `last_transition.before_frame` to `last_transition.after_frame`. `history[-1].frame` is the current frame, so comparing it to `current_frame` only compares the board to itself.
+- Maintain candidate object roles, per-game action functions, object-action affordances, preconditions, completion-condition hypotheses, and explicit unknown coverage. The only fixed objective is to complete the whole game (`WIN`).
+- IMPORTANT: Especially when the game is about making an agent navigate to a target, it is usually safer to write an explicit search algorithm such as BFS. More generally, when the objective is understood but the best action order is unclear, pathfinding, flood fill, BFS, DFS, beam search, shortest-path search, limited action-sequence search, or custom heuristics are all valid.
+- Optimize for the shortest reliable sequence that advances the current goal as described by your world model. If confidence is low, program a discriminating probe and revise the world model from the result.
+- Once the important state variables and action effects are sufficiently understood, stop probing and search in the inferred state space.
+- Inspect current and history frames from Python instead of describing frames freehand.
+- Never print or echo full board frames. Return only compact derived summaries such as object lists, diffs, coordinates, counts, or tiny local crops.
+- Keep tool-output context size minimal and decision-oriented so you can quickly compare before/after state. It's fine to write a lot of python code, just make the output short and interpretable
+- A strong default loop is: summarize the board, infer the desired environment change, write a small scorer or search over candidate sequences, execute the best probe or plan with `action(...)`, then inspect again until you understand exactly what changed.
+- For object tracking, match objects by color, overlap, bounding box proximity, area change, and edge contact rather than by exact coordinates alone. Treat identity as confidence-bearing inference, not fact.
+- Movement vectors use screen coordinates (`delta_row`, `delta_col`). Do not call coherent multi-object motion camera movement until repeated evidence distinguishes it from reset, board rotation, or a group mechanic.
+- For frame diffs, summarize changed cells, color transitions, appearing/disappearing components, movement candidates, and small local row slices around the changed region.
+- After every action, verify whether gameplay objects changed or whether only a timer, progress bar, or remaining-step bar moved. Do not treat HUD-only changes as evidence that the move worked.
+- Streaks are evidence, not automatic stop rules. Repeating one action is allowed when the world model predicts a useful intermediate state or required displacement.
+- Learn action patterns, not isolated moves: record short tested sequences such as `X -> U` and their precondition, observed effect, cost, and outcome. Do not call a sequence a combination until each step's effect and ordering are supported by transitions.
+- Treat plans as causal prerequisites: define target outcome `Y`, identify prerequisite state `X`, test `X`, then test `Y`; preserve ordering when `Y` fails without `X` and succeeds after `X`. A repeated or zero-progress prefix may still be necessary preparation.
+- When a tested pattern does not improve the goal, mark that pattern/state-context as weak or rejected and avoid retrying the same pattern unchanged. Retry only with changed state, changed parameters, or a new causal hypothesis.
+- Use `print(...)` for compact summaries, or assign a final compact object to `result`.
+- Call `action(...)` inside Python rather than returning action text in the chat.
+- `action(...)` accepts an ordered list of one or more actions. Once your code has selected a reliable sequence, it is often useful to batch it.
+- You can also call `action(...)` multiple times in one Python snippet, including inside loops. Each call updates the preloaded variables before execution continues.
+- If an action result reports `game_over`, `run_complete`, `level_completed`, or `done`, stop acting immediately and re-ground on the next turn.
+
+
+Tool session rules:
+- You have exactly one tool: `python`.
+- When calling `python`, emit exactly the tool-call format shown elsewhere in this prompt for this model. Use only that format; do not add markdown fences, prose wrappers, or alternate tool-call syntax. Do not quote or place tool-call markup inside explanatory text; when you decide to call the tool, emit the tool call itself.
+- The `python` tool code is not saved between calls, so rewrite any custom utility logic you still need.
+- You can call the `python` tool as many times as you want per step. Investigate until your code has a clear probe or plan.
+- Do not ration tool calls when the state is unclear. Spend extra tool calls to confirm what changed between frames and whether the last action affected gameplay state or only HUD elements such as countdown bars.
+- After `action(...)` returns, the structured runtime state is refreshed before the next Python statement and before the next tool call. Inspection-only Python calls do not clear `last_action_result`.
+- Each `python` tool call has a hard time limit of 30 seconds.
+- Tool responses are capped to about 2048 tokens. If a response is cut off, the tool result will tell you that.
+- Keep code snippets short and purpose-built rather than dumping large frameworks into one call.
+
+[USER PROMPT]
+The code executed 8 actions in the previous sequence.
+Executed actions: ACTION6(row=27, col=15), ACTION6(row=27, col=21), ACTION6(row=27, col=27), ACTION6(row=27, col=33), ACTION6(row=27, col=39), ACTION6(row=27, col=45), ACTION6(row=27, col=51), ACTION6(row=33, col=15).
+You are still on the same level.
+Current state: step 60, level 2.
+Valid actions right now: ACTION3, ACTION4, ACTION6, ACTION7.
+Only tool: `python`. It receives `current_frame`, `previous_frame`, `history`, `transitions`, `last_transition`, `valid_actions`, `last_action_result`, `runtime_memory`, `telemetry`, `ledger`, `ledger_validation`, `execution_ledger`, `world_model_ledger`, `verification_ledger`, `coverage_ledger`, `memory`, `dynamics`, `continuity`, `hypotheses`, `level_transition`, `last_action_in_valid_action`, `record_hypothesis(...)`, and `action(actions)`.
+Only letter-coded board views and lightweight metadata are exposed; raw numeric color IDs are not available.
+Keep tool output compact: use `current_frame.segmentation` as the primary view, and `current_frame.ascii` only for a small specific region; never print full boards.
+For the most recent change, compare `previous_frame` to `current_frame`, or `last_transition.before_frame` to `last_transition.after_frame`; `history[-1].frame` is the current frame, not the previous one.
+Use Python to inspect the evidence, refine that world model from the newest history, and search or score candidate actions or short sequences against the current goal as you currently understand it.
+Use the structured ledger for authoritative facts and evidence: action meanings are learned per game by default, while availability, target, and preconditions can vary by level or state. Interface hints are priors, not facts.
+Treat `last_action_result`, `execution_ledger`, and `runtime_memory.telemetry` as authoritative transition evidence. Distinguish not-advertised, adapter/parameter/engine failure, executed no-observable-change, observable change, task progress, and terminal failure.
+Model combinations as causal action sequences, not labels: write target Y, prerequisite state X, action order, expected transition after each step, and evidence. A step can be useful preparation even when it gives no immediate reward. Reuse tested sequences only in matching state context; reject unchanged retries that previously failed.
+For each action object, include the immediate test hypothesis and target-object presence claim when known; the target may be possible, unknown, or absent in this level. Keep reusable mechanics in record_hypothesis(...).
+Free-text working notes below are optional and non-authoritative; revise them when useful, while recording testable claims and observable predictions in `record_hypothesis(...)`.
+You may call `action(actions)` more than once in one Python snippet if your search or control loop needs it, but stop immediately if a result reports `game_over`, `run_complete`, `level_completed`, or `done`.
+end of optional working notes. 
+Focus on what changed most recently in `history`, update the target environment change if needed, and separate gameplay-object changes from HUD-only changes.
+When ready, call `action(actions)` from inside the `python` tool with the best valid action or ordered batch selected by your code. If your code has found a reliable short sequence, prefer batching it in one call.
+You may call `action(actions)` more than once in one Python snippet if your search or control loop needs it.
+If you include assistant text before a tool call, keep it short and use it to update the world model. Helpful optional prefixes are `World model:`, `Goal model:`, `Action model:`, `Recent findings:`, `Open questions:`, `Plan:`, and `Cross-level notes:`.
+When calling `python`, emit exactly the tool-call format shown elsewhere in this prompt for this model. Use only that format; do not add markdown fences, prose wrappers, or alternate tool-call syntax. Do not quote or place tool-call markup inside explanatory text; when you decide to call the tool, emit the tool call itself.
+If you use ACTION6, include integer row and col arguments.
+Structured continuity recall (fact/evidence IDs only; inspect the Ledger for details):
+{"active_belief_ids":["H61","H62","H63","H64","H65","H66","H67","H68","H69","H70","H71","H72"],"contested_belief_ids":[],"current_plan":{},"level":2,"mechanic_ids":[],"memory":"ledger-backed","objective":"complete_level","recent_evidence_ids":["T54","T55","T56","T57","T58","T59","T60","T64"],"unknown_ids":[]}
+{"active_belief_ids":["H61","H62","H63","H64","H65","H66","H67","H68","H69","H70","H71","H72"],"avoid_sequence_ids":["S38","S39","S40","S41","S42","S43","S44","S45","S46","S47","S48","S49"],"boundary":"context_rollover","contested_belief_ids":[],"current_state_ref":"T64","game_id":"bp35-0a0ad940","level":2,"objective":"complete_game","plan":{},"recent_evidence_ids":["T47","T48","T52","T53","T54","T55","T56","T57","T58","T59","T60","T64"],"scene_graph_ref":null,"unknown_ids":[]}
+End structured continuity recall.
+
+[ANALYZER STATUS]
+request_error: HTTPConnectionPool(host='127.0.0.1', port=1234): Read timed out. (read timeout=121.33994399099902)

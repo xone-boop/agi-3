@@ -1,0 +1,733 @@
+LATEST MODEL CALL SNAPSHOT
+model: Qwen3.8-27B-FP8
+base_url: http://127.0.0.1:1234/v1
+analysis_step: 19
+action: 58
+request_index_within_turn: 1
+message_count: 11
+tool_choice: auto
+
+[AVAILABLE TOOLS]
+- python: Run one ephemeral Python snippet against preloaded ASCII game state. Available globals: `current_frame`, `previous_frame`, `history`, `transitions`, `last_transition`, `valid_actions`, `last_action_result`, `ledger`, `ledger_validation`, `execution_ledger`, `world_model_ledger`, `verification_ledger`, `coverage_ledger`, and `action(actions)` for executing one or more real environment actions. `current_frame` and each `history[*].frame` expose only `.ascii`, `.segmentation`, `.step`, and `.level`; `history[-1].frame` is the current post-action frame, not the previous frame. For before/after diffs, compare `previous_frame` to `current_frame` or use `last_transition.before_frame` and `.after_frame`. For canonical ACTION6, pass `row` and `col` integer fields; legacy x/y fields are rejected. The raw numeric grid is not available. Use `.segmentation` as the primary view; use `.ascii` only to read a small, specific region. Use `print(...)` for compact output or assign final data to `result`.
+
+[MODEL INPUT]
+[SYSTEM]
+You are a coding agent solving a grid-based puzzle game.
+Game overview:
+- You are solving a multi-level grid puzzle game. 
+- You are called repeatedly over the course of a run. Treat each turn as one observe-plan-act cycle: re-understand the current state from the newest frame, update your working world model in Python, choose the next best action or short sequence against the goal as currently understood, execute it, and expect to re-evaluate on the next turn from the updated state.
+- Your job is to solve the entire game by clearing every level, not just the current screen.
+- An action's learned meaning normally persists across levels of the same game. Availability, target, and preconditions may still vary by level; create a level-specific semantic override only after contradictory evidence.
+- Across different games, learned action meanings reset to hypotheses; only the standardized interface contract transfers.
+- Optimize for as few in-game actions as possible while still being reliable.
+- In this environment, boards are presented as 64 x 64 color grids rendered with ARC color symbols.
+- Color legend: W=white, w=light gray, g=gray, G=dark gray, c=charcoal, B=black, M=magenta, P=pink, R=red, b=blue, S=sky blue, Y=yellow, O=orange, r=dark red, N=light green, p=purple.
+Runtime variables inside every `python` tool call:
+- `current_frame` is a lightweight frame view for the latest environment state.
+- `current_frame` exposes only `.ascii`, `.step`, `.level`, `.shape`, and `.segmentation`.
+- `current_frame.ascii` is a single newline-delimited string containing the latest board rendered with the letter-coded ARC color symbols.
+- `current_frame.segmentation` parses the board into objects. It returns `{'nodes': [...], 'adjacency_list': [...]}`.
+- Each node in `segmentation['nodes']` is one 4-connected same-color object with: `id` (index, ordered top-most-left-most), `color` (ARC color character), `hash` (a signature of the object's color and shape that ignores its position -- equal hashes mean the same object regardless of where it is, so use it to track an object across frames or to spot multiple identical objects in one frame), `pixels` (cell count), `boundary` (clockwise outer-perimeter corner points as `[row, col]`), and `children` (ids of objects fully enclosed by this one).
+- `segmentation['adjacency_list']` is a list of `[i, j]` node-id pairs whose objects share an edge.
+- `current_frame.step` is the current environment step count.
+- `current_frame.level` is the current level number.
+- `current_frame.shape` is a `(rows, cols)` tuple.
+- The raw numeric grid is intentionally not exposed. Use `current_frame.segmentation` as your primary view of the board -- objects, colors, shapes, containment, adjacency, and cross-frame object hashes. Use `current_frame.ascii` only to read a small, specific region; do not scan the whole board with it.
+- `history` is a chronological list of action/frame snapshots.
+- `history` is a Python list of objects, not a dict.
+- Each history entry exposes only `.action` and `.frame`; entries are not subscriptable like `entry['action']`.
+- Each `history[i].frame` is the frame after `history[i].action`; each frame exposes only `.ascii`, `.step`, `.level`, `.shape`, and `.segmentation`.
+- Important history semantics: when `history` is non-empty, `history[-1].frame` is the same latest/post-action board as `current_frame`. It is not the previous board. To inspect the state before the latest action, use `previous_frame` or `history[-2].frame` when available.
+- `previous_frame` is the frame before the most recent real environment action, or `None` if no previous frame is available.
+- `last_action` is the most recent real environment action name/display, or `None` before any real action.
+- `last_action_frame` is the post-action frame for `last_action`; it matches `current_frame` after a real action.
+- `transitions` is a chronological list of actual action transitions, excluding the initial seeded frame. Each transition exposes `.action`, `.before_frame`, `.after_frame`, `.frame` (alias of `.after_frame`), and `.result`.
+- `last_transition` is `transitions[-1]` or `None`. Its `.result` mirrors `last_action_result`; older transitions may have an empty `.result`. For before/after diffs, compare `last_transition.before_frame` to `last_transition.after_frame`; do not compare `current_frame` to `history[-1].frame`.
+- `last_action_result` is the persisted result dict from the most recent `action(...)` call. It remains available across later Python inspection calls that do not call `action(...)`, and is `{}` before any action result exists. Read transition metadata from fields/keys such as `last_action_result['board_changed']`, `last_action_result['done']`, `last_action_result['level_completed']`, `last_action_result['game_over']`, `last_action_result['run_complete']`, `last_action_result['reward']`, and `last_action_result['valid_actions']`.
+- `last_action_in_valid_action` reports whether the most recent action was legal under the valid-action list before it ran.
+- `telemetry` contains recent observation hashes, task/observable progress streaks, HUD/gameplay change classification, and changed-cell samples. An observation hash is not proof of complete latent-state identity.
+- `telemetry['task_no_progress_streak']` counts actions without engine task progress; `observable_no_change_streak` counts unchanged observations; `repeated_action_streak` counts identical displayed actions.
+- `level_transition` contains the last two frames and last five actions around the most recent level transition when one occurred.
+- `ledger` is the compact authoritative Inform view. `execution_ledger`, `world_model_ledger`, `verification_ledger`, and `coverage_ledger` expose its structured components; free prose is non-authoritative.
+- `ledger_validation` reports semantic-schema invariant failures without silently coercing or deleting evidence.
+- `hypotheses` contains structured candidates and predictions. Facts are separate from hypotheses, and unexecuted requests are never no-op evidence.
+- Record a probe with `record_hypothesis({...})` (alias `record_expectation`). Prefer fields `kind`, canonical `action` or `action_sequence`, `claim`, `scope`, `target_binding`, `preconditions`, and observable `predictions` such as `{'field':'object_changes.moved','op':'nonempty'}`.
+- A descriptive effect without an observable predicate is preserved but verifies as inconclusive, not supported or refuted.
+- `valid_actions` is the current list of advertised canonical action IDs. Not advertised, rejected, unexecuted, and executed-with-no-observable-change are distinct outcomes.
+- Call `action(actions)` to execute one or more real environment actions from Python.
+- Pass `action(actions)` a list like `['ACTION3']` or `[{'action': 'ACTION6', 'row': 4, 'col': 7}]`.
+- One action usually returns one frame, but a single action can result in a short multi-frame animation.
+- After `action(actions)` returns, `current_frame`, `previous_frame`, `history`, `transitions`, `valid_actions`, and `last_action_result` are refreshed.
+Multimodal context:
+- User turns include an attached image of the current ARC grid.
+- The image and `current_frame.ascii` are two representations of the same current frame.
+- You can use images and other tools to understand the game state and guide your strategy, each may be useful depending on the current uncertainty.
+Visual-game guidance:
+- Treat each board as a scene with objects, blockers, targets, adjacency, containment, motion, and symmetry.
+- Game entities are usually be rendered as connected multi-tile shapes such as 2×2, 2×3, 3×3, or longer patterned structures. Sometime they might also be 1x1 tokens.- Some games are logic or layout puzzles with no explicit player avatar or controllable sprite on the board. Do not assume a player exists; the relevant state may be an object, region, cursor, selector, or whole-board configuration.
+- Background colors are often white or gray/black-ish large regions, but not always. Verify background hypotheses by area, stability, and object boundaries rather than assuming them.
+- In many games, a long horizontal or vertical line near an edge is a timer or remaining-steps bar. It often shrinks or changes each step. If you identify such a bar, do not get distracted by it or treat it as core gameplay state unless there is concrete evidence that it interacts with the puzzle mechanics.
+A common failure mode is to mistake a segmented edge bar for clickable puzzle pieces. If a repeated strip of small blocks sits flush against the top, bottom, left, or right border and actions only change that strip while the interior board stays the same, classify it as HUD/timer state, not as an object to click through segment by segment. DON'T DO THIS!
+- Use coordinates only to target actions or describe local evidence. Do not frame the objective as reaching a specific absolute row or column.
+- Re-ground on the newest frame after any score increase or abrupt scene change; the returned board may already be the next level.
+- `WIN` means the whole game is solved. Mid-run level completion is more likely to appear as a score increase while play continues.
+- Strategies may transfer loosely across levels, but layouts and mechanics can change. Re-check the new board before repeating a plan.
+- `ACTION1`...`ACTION7` are canonical engine IDs, not semantic facts. Direction/interaction labels are interface priors only.
+- For coordinate action `ACTION6`, pass `row` and `col` integer arguments. `row` is vertical position, `col` is horizontal position.
+Python tool guidance:
+- Use `current_frame.segmentation` as your primary view of the board -- objects, colors, containment, adjacency, and cross-frame object hashes.
+- Use `current_frame.ascii` only to read a small, specific region of the board when `segmentation` is not enough; never use it to scan or summarize the whole board.
+- Every `python` tool call starts fresh. Re-import modules or re-define any custom utility logic you need.
+- The only importable standard-library modules are: bisect, collections, copy, fractions, functools, heapq, itertools, json, math, operator, random, re, statistics, string.
+- The only tool is `python`; call it with one ephemeral `code` string.
+- Always inspect `current_frame`, `history`, and `valid_actions` from Python instead of reasoning from the raw board by eye.
+- For the most recent change, compare `previous_frame` to `current_frame`, or `last_transition.before_frame` to `last_transition.after_frame`. `history[-1].frame` is the current frame, so comparing it to `current_frame` only compares the board to itself.
+- Maintain candidate object roles, per-game action functions, object-action affordances, preconditions, completion-condition hypotheses, and explicit unknown coverage. The only fixed objective is to complete the whole game (`WIN`).
+- IMPORTANT: Especially when the game is about making an agent navigate to a target, it is usually safer to write an explicit search algorithm such as BFS. More generally, when the objective is understood but the best action order is unclear, pathfinding, flood fill, BFS, DFS, beam search, shortest-path search, limited action-sequence search, or custom heuristics are all valid.
+- Optimize for the shortest reliable sequence that advances the current goal as described by your world model. If confidence is low, program a discriminating probe and revise the world model from the result.
+- Once the important state variables and action effects are sufficiently understood, stop probing and search in the inferred state space.
+- Inspect current and history frames from Python instead of describing frames freehand.
+- Never print or echo full board frames. Return only compact derived summaries such as object lists, diffs, coordinates, counts, or tiny local crops.
+- Keep tool-output context size minimal and decision-oriented so you can quickly compare before/after state. It's fine to write a lot of python code, just make the output short and interpretable
+- A strong default loop is: summarize the board, infer the desired environment change, write a small scorer or search over candidate sequences, execute the best probe or plan with `action(...)`, then inspect again until you understand exactly what changed.
+- For object tracking, match objects by color, overlap, bounding box proximity, area change, and edge contact rather than by exact coordinates alone.
+- For frame diffs, summarize changed cells, color transitions, appearing/disappearing components, movement candidates, and small local row slices around the changed region.
+- After every action, verify whether gameplay objects changed or whether only a timer, progress bar, or remaining-step bar moved. Do not treat HUD-only changes as evidence that the move worked.
+- Streaks are evidence, not automatic stop rules. Repeating one action is allowed when the world model predicts a useful intermediate state or required displacement.
+- Learn action patterns, not isolated moves: record short tested sequences such as `X -> U` and their precondition, observed effect, cost, and outcome. Do not call a sequence a combination until each step's effect and ordering are supported by transitions.
+- Treat plans as causal prerequisites: define target outcome `Y`, identify prerequisite state `X`, test `X`, then test `Y`; preserve ordering when `Y` fails without `X` and succeeds after `X`. A repeated or zero-progress prefix may still be necessary preparation.
+- When a tested pattern does not improve the goal, mark that pattern/state-context as weak or rejected and avoid retrying the same pattern unchanged. Retry only with changed state, changed parameters, or a new causal hypothesis.
+- Use `print(...)` for compact summaries, or assign a final compact object to `result`.
+- Call `action(...)` inside Python rather than returning action text in the chat.
+- `action(...)` accepts an ordered list of one or more actions. Once your code has selected a reliable sequence, it is often useful to batch it.
+- You can also call `action(...)` multiple times in one Python snippet, including inside loops. Each call updates the preloaded variables before execution continues.
+- If an action result reports `game_over`, `run_complete`, `level_completed`, or `done`, stop acting immediately and re-ground on the next turn.
+Tool session rules:
+- You have exactly one tool: `python`.
+- When calling `python`, emit exactly the tool-call format shown elsewhere in this prompt for this model. Use only that format; do not add markdown fences, prose wrappers, or alternate tool-call syntax. Do not quote or place tool-call markup inside explanatory text; when you decide to call the tool, emit the tool call itself.
+- The `python` tool code is not saved between calls, so rewrite any custom utility logic you still need.
+- You can call the `python` tool as many times as you want per step. Investigate until your code has a clear probe or plan.
+- Do not ration tool calls when the state is unclear. Spend extra tool calls to confirm what changed between frames and whether the last action affected gameplay state or only HUD elements such as countdown bars.
+- After `action(...)` returns, the structured runtime state is refreshed before the next Python statement and before the next tool call. Inspection-only Python calls do not clear `last_action_result`.
+- Each `python` tool call has a hard time limit of 30 seconds.
+- Tool responses are capped to about 2048 tokens. If a response is cut off, the tool result will tell you that.
+- Keep code snippets short and purpose-built rather than dumping large frameworks into one call.
+
+[USER]
+The code executed 2 actions in the previous sequence.
+Executed actions: ACTION2, ACTION5.
+You are still on the same level.
+Current state: step 49, level 1.
+Valid actions right now: ACTION1, ACTION2, ACTION3, ACTION4, ACTION5.
+Only tool: `python`. It receives `current_frame`, `previous_frame`, `history`, `transitions`, `last_transition`, `valid_actions`, `last_action_result`, `runtime_memory`, `telemetry`, `ledger`, `ledger_validation`, `execution_ledger`, `world_model_ledger`, `verification_ledger`, `coverage_ledger`, `hypotheses`, `level_transition`, `last_action_in_valid_action`, `record_hypothesis(...)`, and `action(actions)`.
+Only letter-coded board views and lightweight metadata are exposed; raw numeric color IDs are not available.
+Keep tool output compact: use `current_frame.segmentation` as the primary view, and `current_frame.ascii` only for a small specific region; never print full boards.
+For the most recent change, compare `previous_frame` to `current_frame`, or `last_transition.before_frame` to `last_transition.after_frame`; `history[-1].frame` is the current frame, not the previous one.
+Use Python to inspect the evidence, refine that world model from the newest history, and search or score candidate actions or short sequences against the current goal as you currently understand it.
+Use the structured ledger for authoritative facts and evidence: action meanings are learned per game by default, while availability, target, and preconditions can vary by level or state. Interface hints are priors, not facts.
+Treat `last_action_result`, `execution_ledger`, and `runtime_memory.telemetry` as authoritative transition evidence. Distinguish not-advertised, adapter/parameter/engine failure, executed no-observable-change, observable change, task progress, and terminal failure.
+Model combinations as causal action sequences, not labels: write target Y, prerequisite state X, action order, expected transition after each step, and evidence. A step can be useful preparation even when it gives no immediate reward. Reuse tested sequences only in matching state context; reject unchanged retries that previously failed.
+Free-text working notes below are optional and non-authoritative; revise them when useful, while recording testable claims and observable predictions in `record_hypothesis(...)`.
+You may call `action(actions)` more than once in one Python snippet if your search or control loop needs it, but stop immediately if a result reports `game_over`, `run_complete`, `level_completed`, or `done`.
+Working world model carried from earlier turns:
+- World model: The face-like scene on a light gray background: two charcoal-colored boxes with blue pupils (eyes) at (24-27, 44-47) and (28-31, 16-19), a blue bar with a gray fill (mouth) at (28-31, 28-39), a charcoal-colored box with a blue center at (36-39, 32-35), a green block with a white cap at (48-51, 32-35), and a pink full-width strip at row 63 (probably a timer/HUD). Only ACTION1-5 are available (no coordinate clicks).
+- Goal model: align all parts / all blue centers into the row band at rows 28–31 (the nose is already merged into the left eye at that height, and the mouth is there too). Only the right eye (rows 24–27) is misaligned → move it down by 4.
+- Plan: move up 4 (to get above the eye's row), rotate down (the cap touches the top edge of the eye), pick up, move down 4, drop. First execute the positioning + pickup, then verify.
+- Revise any item above immediately if `current_frame` or `history` contradicts it.
+end of optional working notes. 
+Focus on what changed most recently in `history`, update the target environment change if needed, and separate gameplay-object changes from HUD-only changes.
+When ready, call `action(actions)` from inside the `python` tool with the best valid action or ordered batch selected by your code. If your code has found a reliable short sequence, prefer batching it in one call.
+You may call `action(actions)` more than once in one Python snippet if your search or control loop needs it.
+If you include assistant text before a tool call, keep it short and use it to update the world model. Helpful optional prefixes are `World model:`, `Goal model:`, `Action model:`, `Recent findings:`, `Open questions:`, `Plan:`, and `Cross-level notes:`.
+When calling `python`, emit exactly the tool-call format shown elsewhere in this prompt for this model. Use only that format; do not add markdown fences, prose wrappers, or alternate tool-call syntax. Do not quote or place tool-call markup inside explanatory text; when you decide to call the tool, emit the tool call itself.
+Current grid image:
+
+[ASSISTANT]
+Let me check the timer rate and the G→c settling behavior to constrain my plan.
+[REASONING]
+Timer: the pink bar is currently at cols 0-48 (49 px). It was 64 at the start, and now it's 49. So about 15 out of 64 have been consumed... but I've already executed about 49 actions. Hmm, the timer might not be per-action. Wait, at frame 6 the pink was 62 (2 consumed), and now at step 49 it's 49. Let me think: the timer might decrease by 1 per action after some point, or it might be time-based. 64 → 49 = 15 consumed over about 43 actions. Hmm, that's slow. Actually, the timer might decrease by 1 per action, but only started after a certain point. Or maybe it's real-time based.
+Actually, wait — let me check the history of the pink bar and figure out the rate. Let me look at the pink width across all frames.
+Actually, the important issue is: how much time is left? If the timer reaches 0, it's game over. Let me estimate the rate from the history.
+Let me also finalize the plan. The current state:
+- Left bar (eye + nose): rows 28-31, cols 16-23 (c 24)
+- Mouth: rows 28-31, cols 28-39 (b 28 + g fill)
+- Right eye: rows 28-31, cols 44-47 (G 12)
+- Player: rows 24-26, cols 44-47, facing down (cap at row 27)
+The target (face) state:
+- Left eye: rows 24-27, cols 16-19
+- Right eye: rows 24-27, cols 44-47
+- Nose: rows 28-31, cols 32-35
+- Mouth: rows 36-39, cols 28-39
+First, let me check the rate of the timer, and then decide.
+Actually, let me reconsider. The right eye is G (dark gray), not c. The nose turned from G to c after being adjacent to the left eye (c). The right eye is currently G and is not adjacent to any c part. Let me check: will the right eye stay G, or turn to c? This is important — if the goal requires all parts to be c, then G parts are "wrong." But actually, the parts' colors might just be a "settling" state.
+Hmm, wait. Let me reconsider. Let me look at the colors of the parts in the initial state:
+- Left eye: c (charcoal)
+- Right eye: c (charcoal)
+- Nose: c (charcoal)
+- Mouth: b (blue) with g (gray)
+So in the initial state, all the eyes/nose were c. When I picked up and dropped the nose, it became G. When I picked up and dropped the right eye, it became G. So G = "recently moved / unsettled" state. And G→c happens when... the nose turned to c when it was adjacent to the left eye (c).
+Wait, that's an interesting hypothesis: parts settle (G→c) when they're adjacent to a part of the same "type"? Or do they settle over time? Or do they settle when they're in the "correct" position?
+Let me check: the nose dropped at cols 20-23 (adjacent to the left eye at cols 16-19), and turned G→c. The right eye dropped at cols 44-47 (not adjacent to anything), and is still G.
+Hypothesis A: parts settle (G→c) when adjacent to a same-color part.
+Hypothesis B: parts settle over time (after N actions).
+Hypothesis C: parts settle when in the correct position.
+If hypothesis C is correct, then the nose turning to c at cols 20-23 would mean that cols 20-23 is the correct position for the nose. But that contradicts the face hypothesis (the nose should be at cols 32-35).
+Hmm, this is a problem. Let me reconsider.
+Actually, wait. Let me reconsider the whole thing. What if the G→c change isn't "settling" but rather "fusion" — that is, when the nose (G) was dropped adjacent to the left eye (c), they fused into a single c object? In that case, the right eye (G, not adjacent) would stay G.
+That would support the "fusion" idea: touching parts of the same type fuse. And a fused object can't be separated.
+If that's the case, I've permanently fused the nose and the left eye, and the face goal is impossible... unless the goal isn't a face.
+Let me reconsider the goal from scratch.
+Actually, let me look at the timer rate and the current state, and reconsider what's achievable.
+Let me reconsider: maybe the goal is "align all parts in the same row band" (rows 28-31), and that's already achieved (all parts are in rows 28-31), but it didn't complete. So that's not the goal.
+Or maybe the goal is "all parts in the same row AND the player in a specific position"?
+Or maybe the goal involves the G→c settling: "settle all parts" (all parts become c)? Currently, the right eye is G (unsettled). If I can make it settle (by placing it adjacent to a c part, or by waiting), then all parts would be c. But the mouth is b/g, not c. So "all parts are c" doesn't hold for the mouth.
+Hmm. Let me reconsider.
+Actually, let me step back and think about what makes sense as a game. The player has a "cap" that can grab parts. The parts are face features. The most likely goal is to assemble a face. The G→c and fusion behavior might just be a side effect of the physics/rendering, not the goal.
+But if the nose and left eye are fused, the face can't be assembled. So either:
+1. The face isn't the goal, or
+2. The fusion can be undone (the parts are still separate game objects), or
+3. I'm misreading the situation.
+Let me test hypothesis 2: are the nose and left eye still separate game objects? The only way to test is to try to pick up just the nose.
+But actually, let me reconsider the cost. The timer is at 49/64. Let me check the rate to see how much time I have.
+Let me look at the history of the pink bar.
+[ASSISTANT TOOL CALL: python]
+id: chatcmpl-tool-b9db8498b903925d
+<tool_call>
+<function=python>
+<parameter=code>
+def pinkw(f):
+    for n in f.segmentation['nodes']:
+        if n['color']=='P':
+            b=n['boundary']; return max(p[1] for p in b)-min(p[1] for p in b)+1
+    return None
+# timer over history
+prev=None
+for i,h in enumerate(history):
+    w=pinkw(h.frame)
+    if w!=prev:
+        print(i,h.action,"pinkw",w)
+        prev=w
+print("current pinkw",pinkw(current_frame),"step",current_frame.step)
+</parameter>
+</function>
+</tool_call>
+
+[TOOL RESULT: chatcmpl-tool-b9db8498b903925d]
+0  pinkw 64
+2 ACTION1 pinkw 63
+5 ACTION3 pinkw 62
+8 ACTION3 pinkw 61
+11 ACTION1 pinkw 60
+15 ACTION4 pinkw 59
+18 ACTION2 pinkw 58
+21 ACTION3 pinkw 57
+24 ACTION4 pinkw 56
+27 ACTION2 pinkw 55
+30 ACTION1 pinkw 54
+33 ACTION3 pinkw 53
+36 ACTION1 pinkw 52
+40 ACTION4 pinkw 51
+43 ACTION5 pinkw 50
+46 ACTION5 pinkw 49
+current pinkw 49 step 48
+
+[USER]
+The code executed 2 actions in the previous sequence.
+Executed actions: ACTION2, ACTION5.
+You are still on the same level.
+Current state: step 49, level 1.
+Valid actions right now: ACTION1, ACTION2, ACTION3, ACTION4, ACTION5.
+Only tool: `python`. It receives `current_frame`, `previous_frame`, `history`, `transitions`, `last_transition`, `valid_actions`, `last_action_result`, `runtime_memory`, `telemetry`, `ledger`, `ledger_validation`, `execution_ledger`, `world_model_ledger`, `verification_ledger`, `coverage_ledger`, `hypotheses`, `level_transition`, `last_action_in_valid_action`, `record_hypothesis(...)`, and `action(actions)`.
+Only letter-coded board views and lightweight metadata are exposed; raw numeric color IDs are not available.
+Keep tool output compact: use `current_frame.segmentation` as the primary view, and `current_frame.ascii` only for a small specific region; never print full boards.
+For the most recent change, compare `previous_frame` to `current_frame`, or `last_transition.before_frame` to `last_transition.after_frame`; `history[-1].frame` is the current frame, not the previous one.
+Use Python to inspect the evidence, refine that world model from the newest history, and search or score candidate actions or short sequences against the current goal as you currently understand it.
+Use the structured ledger for authoritative facts and evidence: action meanings are learned per game by default, while availability, target, and preconditions can vary by level or state. Interface hints are priors, not facts.
+Treat `last_action_result`, `execution_ledger`, and `runtime_memory.telemetry` as authoritative transition evidence. Distinguish not-advertised, adapter/parameter/engine failure, executed no-observable-change, observable change, task progress, and terminal failure.
+Model combinations as causal action sequences, not labels: write target Y, prerequisite state X, action order, expected transition after each step, and evidence. A step can be useful preparation even when it gives no immediate reward. Reuse tested sequences only in matching state context; reject unchanged retries that previously failed.
+Free-text working notes below are optional and non-authoritative; revise them when useful, while recording testable claims and observable predictions in `record_hypothesis(...)`.
+You may call `action(actions)` more than once in one Python snippet if your search or control loop needs it, but stop immediately if a result reports `game_over`, `run_complete`, `level_completed`, or `done`.
+Working world model carried from earlier turns:
+- World model: The face-like scene on a light gray background: two charcoal-colored boxes with blue pupils (eyes) at (24-27, 44-47) and (28-31, 16-19), a blue bar with a gray fill (mouth) at (28-31, 28-39), a charcoal-colored box with a blue center at (36-39, 32-35), a green block with a white cap at (48-51, 32-35), and a pink full-width strip at row 63 (probably a timer/HUD). Only ACTION1-5 are available (no coordinate clicks).
+- Goal model: align all parts / all blue centers into the row band at rows 28–31 (the nose is already merged into the left eye at that height, and the mouth is there too). Only the right eye (rows 24–27) is misaligned → move it down by 4.
+- Plan: move up 4 (to get above the eye's row), rotate down (the cap touches the top edge of the eye), pick up, move down 4, drop. First execute the positioning + pickup, then verify.
+- Revise any item above immediately if `current_frame` or `history` contradicts it.
+end of optional working notes. 
+Focus on what changed most recently in `history`, update the target environment change if needed, and separate gameplay-object changes from HUD-only changes.
+When ready, call `action(actions)` from inside the `python` tool with the best valid action or ordered batch selected by your code. If your code has found a reliable short sequence, prefer batching it in one call.
+You may call `action(actions)` more than once in one Python snippet if your search or control loop needs it.
+If you include assistant text before a tool call, keep it short and use it to update the world model. Helpful optional prefixes are `World model:`, `Goal model:`, `Action model:`, `Recent findings:`, `Open questions:`, `Plan:`, and `Cross-level notes:`.
+When calling `python`, emit exactly the tool-call format shown elsewhere in this prompt for this model. Use only that format; do not add markdown fences, prose wrappers, or alternate tool-call syntax. Do not quote or place tool-call markup inside explanatory text; when you decide to call the tool, emit the tool call itself.
+Current grid image:
+
+[ASSISTANT]
+Timer: 49/64, decays ~1 per 3 actions → ~45 actions left. Action semantics confirmed: ACTION1/2/3/4 = move up/down/left/right by 4 (cap rotates to facing side), ACTION5 = pick up/drop the object the cap touches.
+Current state: left eye + nose are fused into one c 24 block (rows 28-31, cols 16-23), mouth (rows 28-31, cols 28-39), right eye (rows 28-31, cols 44-47), player at rows 24-27 cols 44-47 facing down.
+Key uncertainty: can I pick up just the nose (cols 20-23) from the fused bar, or does it grab the whole 4×8? Let me test by positioning above the nose portion and picking up.
+[REASONING]
+The timer decreases by 1 every 3 actions (roughly). Currently 49/64, so about 15 remaining = about 45 actions. Actually: it decreases by 1 every 3 actions. 64→49 is 15 decreases over 48 actions = 1 per 3.2 actions. So about 45 actions remaining. That's a reasonable amount.
+OK, let me finalize the plan. I'm going to commit to the "face" goal and test nose/eye separation.
+No wait. Let me reconsider the goal once more, because if the nose is fused with the left eye, the face goal is impossible, and I don't want to waste 45 actions on an impossible goal.
+Let me reconsider the evidence for the goal:
+1. Initial state: right eye at rows 24-27 (top row), left eye + mouth at rows 28-31, nose at rows 36-39 (bottom).
+2. The parts are face features: 2 eyes, 1 nose, 1 mouth.
+3. The player moves parts around.
+The most natural goal: assemble the face. Target:
+- Eyes at rows 24-27 (cols 16-19, 44-47)
+- Nose at rows 28-31 (cols 32-35)
+- Mouth at rows 36-39 (cols 28-39)
+But the nose is fused with the left eye. So either:
+(a) The face isn't the goal, or
+(b) The fusion can be undone.
+Let me reconsider (a). What if the goal is something else entirely? Let me think about what's special about the current state vs. the initial state.
+Actually, let me reconsider the G→c behavior. Let me hypothesize that the goal is related to the "settling" of the parts. No, that's a stretch.
+Let me reconsider: what if the goal is to make the face "look" at the player, or align the pupils in some way?
+Actually, let me take a totally different approach. Let me reconsider whether the nose and left eye are really fused, or whether they're just touching. Let me look at the hash. The c 24 node has hash cdf252f2. Let me compare it to the original left eye's hash and the original nose's hash. If the fused bar's hash matches neither, then it's a new object (fused). If it matches one of them, then... no, the hashes include shape, and a 4×8 bar has a different shape from a 4×4, so the hash will be different either way.
+The real question is: does the game's pickup treat the 4×8 bar as one object, or can it grab just the 4×4 portion?
+Let me test it. The test is: position the player above the nose portion (cols 20-23), face down, and pick up. Then observe:
+- If W becomes 4×8 (32px) + cap: the whole bar was picked up → fused.
+- If W becomes 4×4 (16px) + cap: only the nose was picked up → separable.
+Let me do this test. But I need to be careful: if the whole bar gets picked up, I should drop it in a safe place (not re-fuse it). Actually, if the whole bar gets picked up, I can just drop it where it was (or somewhere) and accept that the face goal is impossible, and reconsider.
+No, wait. Let me reconsider the cost. The test is about 9 actions (up, left ×6, down, pickup). Plus observation. That's fine within 45 actions.
+But actually, let me reconsider the positioning. Currently the player is at rows 24-26, cols 44-47, facing down (cap at row 27).
+To position above the nose portion (cols 20-23) and face down:
+1. ACTION1 (up): player to rows 20-22, cols 44-47, facing up.
+2. ACTION3 ×6 (left): player to rows 20-22, cols 20-23, facing left. (44-47 → 20-23 is 24 cols = 6 moves of 4)
+3. ACTION2 (down): player to rows 24-26, cols 20-23, facing down, cap at row 27.
+4. ACTION5 (pickup): grab the nose portion (or the whole bar).
+Wait, but in step 3, when the player moves down from rows 20-22 to 24-26, is there anything blocking? The bar is at rows 28-31. The player at rows 24-26 is above the bar (rows 28-31), so no collision. Good. The cap is at row 27, touching the top of the bar (row 28). Good.
+But wait — when the player faces left (after step 2), the cap is on the left side (col 19, rows 20-22). Then in step 3 (ACTION2, down), the player moves down and the cap rotates to the bottom (row 27). Good.
+Let me double-check the left move: the player is at rows 20-22, cols 44-47. Moving left 6 times: 44→40→36→32→28→24→20. So after 6 moves, cols 20-23. Wait, the player body is 4 wide (cols c to c+3). Starting cols 44-47 (c=44). After 1 left: c=40 (cols 40-43). After 6: c=20 (cols 20-23). Good.
+But wait — does the player move exactly 4 per left action? From the trajectory: step 5: cols 32-35 → 29-31 (3 left, blocked?). Hmm, step 5 was 3 left, not 4. Let me check why. At step 5, the player was at rows 44-47, cols 32-35, and moved left to 29-31 (3 cols). Was there something at col 28? The mouth is at rows 28-31, cols 28-39 — but that's rows 28-31, and the player is at rows 44-47. No collision. Hmm, why only 3 left?
+Wait, let me re-check. Step 4: N (44,46,32,35) — rows 44-46, cols 32-35. Step 5: ACTION3 → N (44,47,29,31) — rows 44-47, cols 29-31. So the player moved left 3 (32→29), and the rows changed from 44-46 to 44-47 (the body became 4 rows tall because the cap rotated to the left side). So the left move was 3, not 4.
+Hmm, why 3? Let me look at other left moves:
+- Step 8: cols 29-31 → 25-27 (4 left).
+- Step 9: cols 25-27 → 24-27? No, step 9: N (44,47,25,27) → step 9 ACTION3 → N (44,47,25,27)? Let me re-read.
+Actually, the trajectory output is:
+```
+5 ACTION3 N: (44, 47, 29, 31)
+8 ACTION3 N: (44, 47, 29, 31)  <- wait, this is the same as 5?
+```
+No. Let me re-read the actual output:
+```
+5 ACTION3 N: (44, 47, 29, 31) W: [(44, 47, 28, 28, 4)]  <== moved
+6 ACTION4 N: (44, 47, 32, 34) W: [(44, 47, 35, 35, 4)]  <== moved
+7 ACTION5 N: (44, 47, 32, 34) W: [(44, 47, 35, 35, 4)] 
+8 ACTION3 N: (44, 47, 29, 31) W: [(44, 47, 28, 28, 4)]  <== moved
+9 ACTION3 N: (44, 47, 25, 27) W: [(44, 47, 24, 24, 4)]  <== moved
+```
+Wait, step 8: N (44,47,29,31), step 9: N (44,47,25,27). So step 9 moved left 4 (29→25). And step 5 moved left 3 (32→29), step 8 moved left 3 (32→29).
+Hmm, inconsistent: sometimes 3, sometimes 4. Let me look more carefully.
+Step 4: N (44,46,32,35) — body rows 44-46, cols 32-35 (4 wide). Cap at row 47 (W (47,47,32,35)). So facing down.
+Step 5: ACTION3 → N (44,47,29,31) — body rows 44-47, cols 29-31 (3 wide). Cap at col 28 (W (44,47,28,28)). So facing left. The body went from cols 32-35 to 29-31. That's left 3 (32→29). And the body width changed from 4 to 3 (because the cap moved from bottom to left side).
+Hmm, so when the player rotates from facing down to facing left, the body's bounding box changes. The player is a 4×4 square. When facing down: body 4 wide × 3 tall (rows r to r+2) + cap 4 wide × 1 tall (row r+3). When facing left: body 3 wide × 4 tall (rows r to r+3) + cap 1 wide × 4 tall (col c-1).
+So the "anchor" of the player: let me think of the player as a 4×4 square occupying rows R to R+3, cols C to C+3. The cap is the row/column on the side it's facing.
+- Facing down: cap is row R+3 (bottom), body is rows R to R+2. N bbox = rows R to R+2, cols C to C+3. W bbox = row R+3, cols C to C+3.
+- Facing left: cap is col C (left), body is cols C+1 to C+3. N bbox = rows R to R+3, cols C+1 to C+3. W bbox = col C, rows R to R+3.
+So the 4×4 square is rows R to R+3, cols C to C+3.
+Step 4: facing down. N (44,46,32,35) = rows 44-46, cols 32-35. So R=44, C=32. Square = rows 44-47, cols 32-35. Cap = row 47.
+Step 5: ACTION3 (left). N (44,47,29,31) = rows 44-47, cols 29-31. So the body is cols 29-31, cap is col 28. Square = rows 44-47, cols 28-31. So C went from 32 to 28 = left 4!
+I was misreading. The square moved left 4 (C: 32→28), not 3. The N bbox changed because the cap rotated. So the player moves exactly 4 per action.
+Let me verify with step 8→9: step 8 N (44,47,29,31): body cols 29-31, cap col 28, square cols 28-31 (C=28). Step 9 N (44,47,25,27): body cols 25-27, cap col 24, square cols 24-27 (C=24). So C: 28→24 = left 4.
+So the player moves exactly 4 per action (when not blocked).
+Now let me redo the positioning. The player square is currently at rows 24-27, cols 44-47 (R=24, C=44), facing down (cap row 27). Wait, let me confirm: the player is N (24,26,44,47) = rows 24-26, cols 44-47, cap W (27,27,44,47) = row 27. So the square = rows 24-27, cols 44-47. R=24, C=44. Facing down.
+To position above the nose portion (cols 20-23) and face down:
+- I want the square at rows 20-23, cols 20-23 (R=20, C=20), then face down so the cap is at row 23... no wait.
+Hmm, let me reconsider. I want the cap at row 27 (touching the top of the bar at row 28). The cap is the bottom row of the square when facing down. So the square's bottom row (R+3) = 27 → R=24. And the square's cols should be 20-23 (C=20). So the square is at rows 24-27, cols 20-23, facing down, cap at row 27.
+But to face down, the last move must be ACTION2 (down). Before that move, the square was at rows 20-23, cols 20-23 (R=20, C=20), facing left or right.
+So:
+1. Get the square to rows 20-23, cols 20-23, facing left/right.
+2. ACTION2 (down) → square to rows 24-27, cols 20-23, facing down, cap at row 27.
+3. ACTION5 (pickup).
+Currently: square at rows 24-27, cols 44-47 (R=24, C=44), facing down.
+- ACTION1 (up): square to rows 20-23, cols 44-47 (R=20, C=44), facing up.
+- ACTION3 ×6 (left): square to rows 20-23, cols 20-23 (C=44→20), facing left.
+- ACTION2 (down): square to rows 24-27, cols 20-23, facing down, cap at row 27.
+- ACTION5 (pickup).
+Total: 1+6+1+1 = 9 actions.
+But wait, I need to double-check: when moving left at rows 20-23, is there anything blocking? The bar is at rows 28-31. The player is at rows 20-23. No collision. Good. And when moving up from rows 24-27 to 20-23, is there anything at rows 20-23, cols 44-47? The right eye is at rows 28-31, cols 44-47 (below). Rows 20-23 are empty. Good.
+So the sequence: [ACTION1, ACTION3, ACTION3, ACTION3, ACTION3, ACTION3, ACTION3, ACTION2, ACTION5].
+Then observe what got picked up. Let me run this and check.
+Actually, wait. Let me reconsider whether I should do this test, or whether I should reconsider the goal first. The risk: if the whole bar gets picked up (fused), I've spent 9 actions and confirmed the face goal is impossible. Then I need to drop the bar and reconsider. That's fine — 9 actions is acceptable.
+But actually, let me reconsider: is there a way to determine fusibility without the full test? No, I think the test is necessary.
+Actually, let me reconsider the goal once more. Let me look at the initial frame and think about what the "solved" state looks like, from the perspective of the game's win condition.
+Hmm, I keep going in circles. Let me just do the separation test. It's the key uncertainty, and it's relatively cheap.
+Actually, wait. Let me reconsider the timer. 49/64, decreasing by 1 every 3 actions. So about 45 actions remaining. The test is 9 actions. If the face goal is possible, the full solution from the current state is:
+1. Separate the nose from the left eye (test: 9 actions for pickup, then move the nose to cols 32-35).
+2. Move the mouth down 8.
+3. Move the right eye up 4.
+4. Move the left eye up 4.
+That's a lot of actions. Let me estimate:
+- Nose: pickup (9) + move right 12 (3 left... no, right 3) + reposition + drop. Actually, after picking up the nose (player at rows 24-27, cols 20-23, facing down, nose below at rows 28-31, cols 20-23), I need to move the nose to rows 28-31, cols 32-35. So move right 12 (3 ACTION4) → nose to cols 32-35. Then drop (ACTION5). But wait, the mouth is at rows 28-31, cols 28-39, which overlaps with cols 32-35! So I can't place the nose at cols 32-35 while the mouth is there. I have to move the mouth first.
+So the order:
+1. Move the mouth down 8 (to rows 36-39, cols 28-39).
+2. Separate the nose and move it to rows 28-31, cols 32-35.
+3. Move the right eye up 4 (to rows 24-27, cols 44-47).
+4. Move the left eye up 4 (to rows 24-27, cols 16-19).
+Let me estimate the actions:
+1. Mouth: position above the mouth (cols 28-39, 12 wide). The player is 4 wide. Stand above the mouth, say cols 32-35, facing down, cap at row 27. Pick up the mouth (4×12 — can the player carry a 12-wide object? The nose was 4×4. The mouth is 4×12. When carried, the W would be 4×12 = 48px + cap. Hmm, can the player carry something 3× wider than itself? Unclear. Risk.)
+   Actually, wait — the mouth is 4×12 (rows 28-31, cols 28-39). When I pick it up, does it become a 4×12 white block? And does it move with the player? The player is 4 wide. If the mouth is 12 wide, it would extend beyond the player. That might not work, or it might be centered on the player.
+   This is a risk. Let me reconsider.
+   Actually, maybe I should move the mouth by a different method. Hmm, but the player is the only way to move parts.
+   Let me reconsider: maybe the mouth doesn't need to move. Let me reconsider the target.
+   What if the target face is:
+   - Eyes at rows 24-27 (cols 16-19, 44-47)
+   - Mouth at rows 28-31 (cols 28-39) [the mouth stays where it is!]
+   - Nose at rows 36-39 (cols 32-35) [the nose goes back to the bottom!]
+   Wait, that's the initial state (except the left eye is at rows 28-31, not 24-27). Hmm, no. In the initial state: left eye at rows 28-31, mouth at rows 28-31, nose at rows 36-39, right eye at rows 24-27.
+   If the target is "eyes at the top (rows 24-27), mouth in the middle (rows 28-31), nose at the bottom (rows 36-39)," then from the initial state I only need to move the left eye up 4! The mouth and nose are already in place!
+   But wait, that doesn't make sense as a face (the mouth is above the nose). But maybe this game's "face" has the mouth in the middle and the nose at the bottom? That's anatomically weird, but let me consider it.
+   Actually, hmm. Let me reconsider. In the initial state:
+   - Right eye: rows 24-27 (top)
+   - Left eye: rows 28-31 (middle)
+   - Mouth: rows 28-31 (middle)
+   - Nose: rows 36-39 (bottom)
+   If the target is "both eyes at the top (rows 24-27)," then I only need to move the left eye up 4. The mouth (rows 28-31) and nose (rows 36-39) stay. That's a 1-part move!
+   But is that the goal? "Both eyes at the top" — that would make the face:
+   ```
+   E   E      (rows 24-27)
+   MMMM       (rows 28-31)
+    N         (rows 36-39)
+   ```
+   Eyes on top, mouth in the middle, nose at the bottom. Anatomically, the nose should be between the eyes and the mouth, but in this layout the mouth is between the eyes and the nose. Weird, but possible if the game's "face" is stylized.
+   Hmm, but actually, that doesn't look like a face at all. The nose is below the mouth.
+   Let me reconsider. Actually, maybe I'm overthinking the anatomy. Let me focus on what's the minimal, most likely goal.
+   Option A: "Both eyes at the top (rows 24-27)." Requires moving the left eye up 4. (1 part)
+   Option B: "Full face: eyes on top, nose in middle, mouth on bottom." Requires moving the left eye up 4, the nose up 8, the mouth down 8. (3 parts)
+   Option A is much cheaper. And the right eye is already at the top (rows 24-27), which is a strong hint that "eyes at the top" is the goal.
+   But wait — in the current (messed up) state, the left eye is fused with the nose at rows 28-31, cols 16-23. So even for Option A, I need to separate the left eye from the nose (or move the whole bar up 4, but that would put the nose at rows 24-27 too, which might be wrong).
+   Hmm. Let me reconsider.
+   Actually, for Option A ("both eyes at the top"), the target is:
+   - Left eye: rows 24-27, cols 16-19
+   - Right eye: rows 24-27, cols 44-47
+   - Mouth: rows 28-31, cols 28-39 (stays)
+   - Nose: rows 36-39, cols 32-35 (goes back to the bottom)
+   From the current state:
+   - Left bar (eye + nose): rows 28-31, cols 16-23. I need to separate the left eye (cols 16-19) and move it up 4 to rows 24-27, cols 16-19. And the nose (cols 20-23) needs to go to rows 36-39, cols 32-35.
+   - Right eye: rows 28-31, cols 44-47. Move up 4 to rows 24-27, cols 44-47.
+   - Mouth: rows 28-31, cols 28-39. Stays.
+   So I still need to separate the nose from the left eye. Ugh.
+   OK, the separation is unavoidable for any face-like goal. Let me just test it.
+   Actually, wait. Let me reconsider whether the nose is really fused. Let me look at the current c 24 node more carefully. It's rows 28-31, cols 16-23, 24 pixels. The left eye is 4×4 = 16px, the nose is 4×4 = 16px, but the nose has a blue center (4px), so the nose's c part is 12px. 16 + 12 = 28, not 24. Hmm.
+   Wait, let me recount. The left eye: c 12 (4×4 with a 2×2 blue pupil = 16-4 = 12 c pixels). The nose: c 12 (4×4 with a 2×2 blue center = 12 c pixels). If they're fused: 12 + 12 = 24 c pixels. Yes! The c 24 node = left eye (12) + nose (12) = 24. And there are 2 b 4 nodes at cols 17-18 and 21-22 (the left eye's pupil and the nose's center).
+   So the c 24 node is the fused left eye + nose. They're touching (the left eye's cols 16-19, the nose's cols 20-23, sharing the edge at col 19/20).
+   Now, are they one game object or two? The segmentation shows one c node because they're 4-connected same-color. But the game might track them separately.
+   The only way to know: test the pickup. Let me do it.
+   Let me reconsider the timer once more: 49/64, about 45 actions remaining. The test is 9 actions. Let me do it.
+   Actually, let me reconsider: instead of the full 9-action positioning, is there a faster way to test? The player is currently at rows 24-27, cols 44-47, facing down, cap at row 27. The bar is at rows 28-31, cols 16-23. The player's cap (row 27, cols 44-47) is not touching the bar (the bar is at cols 16-23). So I can't pick up right now.
+   I need to move the player to cols 20-23 (above the nose portion). That requires 6 left moves (24 cols). Plus the up/down repositioning. So 9 actions is the minimum.
+   Actually, wait. Let me reconsider. Do I need to be exactly above the nose portion? What if I position above the left eye portion (cols 16-19) instead? Then the pickup would grab the left eye (if separable) or the whole bar (if fused). Either way, it tells me about fusibility. And the left eye portion is at cols 16-19, which is 28 cols left from cols 44-47 = 7 left moves. That's more than the nose portion (6 moves). So the nose portion is closer. Let me use the nose portion.
+   Hmm, wait, actually, let me reconsider. If I position above the nose portion (cols 20-23) and the parts are separable, I pick up the nose. Then I can move the nose away and the left eye is free. If I position above the left eye portion (cols 16-19) and the parts are separable, I pick up the left eye. Either works for the test. The nose portion is closer (6 vs 7 left moves). Let me use the nose portion.
+   Actually, for the eventual goal, I want to move the nose to the bottom (rows 36-39, cols 32-35) [Option A] or to the middle (rows 28-31, cols 32-35) [Option B]. Either way, I pick up the nose first. So positioning above the nose portion is correct.
+   Let me do the test: [ACTION1, ACTION3×6, ACTION2, ACTION5].
+   Wait, I need to double-check the up move. The player is at rows 24-27 (R=24). ACTION1 (up) → R=20, rows 20-23. Is there anything at rows 20-23, cols 44-47? No. Good.
+   Then 6 left moves: C=44→40→36→32→28→24→20. Rows 20-23. Anything in the way? The bar is at rows 28-31. No. Good.
+   Then ACTION2 (down): R=20→24, rows 24-27, facing down, cap at row 27. The bar is at rows 28-31, so the cap (row 27) touches the top of the bar (row 28). Good.
+   Then ACTION5 (pickup).
+   Let me run it and observe.
+   Actually, let me batch it and then inspect. Let me run the sequence and print the result.
+   One concern: after the pickup, if the whole bar (4×8) gets picked up, the W node would be rows 28-31, cols 16-23 (32px) + cap. If only the nose (4×4) gets picked up, the W node would be rows 28-31, cols 20-23 (12px white + 4px blue center) + cap.
+   Let me run it.
+[ASSISTANT TOOL CALL: python]
+id: chatcmpl-tool-8901032441cd6f0a
+<tool_call>
+<function=python>
+<parameter=code>
+# Position above nose portion (cols 20-23), face down, then pick up.
+seq=['ACTION1'] + ['ACTION3']*6 + ['ACTION2','ACTION5']
+res=action(seq)
+print("done",res.get('done'),res.get('level_completed'),res.get('game_over'))
+f=current_frame
+for n in f.segmentation['nodes']:
+    if n['color'] in 'cbGwN' and n['pixels']>=4:
+        b=n['boundary']; rs=[p[0] for p in b]; cs=[p[1] for p in b]
+        print(n['color'],n['pixels'],"rows",min(rs),max(rs),"cols",min(cs),max(cs))
+</parameter>
+</function>
+</tool_call>
+
+[TOOL RESULT: chatcmpl-tool-8901032441cd6f0a]
+done False False False
+w 3920 rows 0 62 cols 0 63
+N 12 rows 24 26 cols 20 23
+c 12 rows 28 31 cols 16 19
+b 28 rows 28 31 cols 28 39
+c 12 rows 28 31 cols 44 47
+b 4 rows 29 30 cols 17 18
+b 4 rows 29 30 cols 21 22
+b 4 rows 29 30 cols 45 46
+c 18 rows 63 63 cols 46 63
+
+[USER]
+The code executed 9 actions in the previous sequence.
+Executed actions: ACTION1, ACTION3, ACTION3, ACTION3, ACTION3, ACTION3, ACTION3, ACTION2, ACTION5.
+You are still on the same level.
+Current state: step 58, level 1.
+Valid actions right now: ACTION1, ACTION2, ACTION3, ACTION4, ACTION5.
+Only tool: `python`. It receives `current_frame`, `previous_frame`, `history`, `transitions`, `last_transition`, `valid_actions`, `last_action_result`, `runtime_memory`, `telemetry`, `ledger`, `ledger_validation`, `execution_ledger`, `world_model_ledger`, `verification_ledger`, `coverage_ledger`, `hypotheses`, `level_transition`, `last_action_in_valid_action`, `record_hypothesis(...)`, and `action(actions)`.
+Only letter-coded board views and lightweight metadata are exposed; raw numeric color IDs are not available.
+Keep tool output compact: use `current_frame.segmentation` as the primary view, and `current_frame.ascii` only for a small specific region; never print full boards.
+For the most recent change, compare `previous_frame` to `current_frame`, or `last_transition.before_frame` to `last_transition.after_frame`; `history[-1].frame` is the current frame, not the previous one.
+Use Python to inspect the evidence, refine that world model from the newest history, and search or score candidate actions or short sequences against the current goal as you currently understand it.
+Use the structured ledger for authoritative facts and evidence: action meanings are learned per game by default, while availability, target, and preconditions can vary by level or state. Interface hints are priors, not facts.
+Treat `last_action_result`, `execution_ledger`, and `runtime_memory.telemetry` as authoritative transition evidence. Distinguish not-advertised, adapter/parameter/engine failure, executed no-observable-change, observable change, task progress, and terminal failure.
+Model combinations as causal action sequences, not labels: write target Y, prerequisite state X, action order, expected transition after each step, and evidence. A step can be useful preparation even when it gives no immediate reward. Reuse tested sequences only in matching state context; reject unchanged retries that previously failed.
+Free-text working notes below are optional and non-authoritative; revise them when useful, while recording testable claims and observable predictions in `record_hypothesis(...)`.
+You may call `action(actions)` more than once in one Python snippet if your search or control loop needs it, but stop immediately if a result reports `game_over`, `run_complete`, `level_completed`, or `done`.
+Working world model carried from earlier turns:
+- World model: The face-like scene on a light gray background: two charcoal-colored boxes with blue pupils (eyes) at (24-27, 44-47) and (28-31, 16-19), a blue bar with a gray fill (mouth) at (28-31, 28-39), a charcoal-colored box with a blue center at (36-39, 32-35), a green block with a white cap at (48-51, 32-35), and a pink full-width strip at row 63 (probably a timer/HUD). Only ACTION1-5 are available (no coordinate clicks).
+- Goal model: align all parts / all blue centers into the row band at rows 28–31 (the nose is already merged into the left eye at that height, and the mouth is there too). Only the right eye (rows 24–27) is misaligned → move it down by 4.
+- Plan: move up 4 (to get above the eye's row), rotate down (the cap touches the top edge of the eye), pick up, move down 4, drop. First execute the positioning + pickup, then verify.
+- Revise any item above immediately if `current_frame` or `history` contradicts it.
+end of optional working notes. 
+Focus on what changed most recently in `history`, update the target environment change if needed, and separate gameplay-object changes from HUD-only changes.
+When ready, call `action(actions)` from inside the `python` tool with the best valid action or ordered batch selected by your code. If your code has found a reliable short sequence, prefer batching it in one call.
+You may call `action(actions)` more than once in one Python snippet if your search or control loop needs it.
+If you include assistant text before a tool call, keep it short and use it to update the world model. Helpful optional prefixes are `World model:`, `Goal model:`, `Action model:`, `Recent findings:`, `Open questions:`, `Plan:`, and `Cross-level notes:`.
+When calling `python`, emit exactly the tool-call format shown elsewhere in this prompt for this model. Use only that format; do not add markdown fences, prose wrappers, or alternate tool-call syntax. Do not quote or place tool-call markup inside explanatory text; when you decide to call the tool, emit the tool call itself.
+Current grid image:
+
+[ASSISTANT]
+The pickup separated the nose from the left eye (left eye now c 12 at cols 16-19 alone). But I don't see the nose's c part or a white cap as separate nodes — the cap and any white carried object would blend into the w background. Let me read the local ascii region to see the actual carried state.
+[REASONING]
+The pickup test results are in. Let me analyze:
+- N 12 rows 24-26 cols 20-23: the player's body (rows 24-26, cols 20-23), facing down, cap at row 27.
+- c 12 rows 28-31 cols 16-19: the left eye (separated!)
+- b 28 rows 28-31 cols 28-39: the mouth
+- c 12 rows 28-31 cols 44-47: the right eye
+- b 4 rows 29-30 cols 17-18: the left eye's pupil
+- b 4 rows 29-30 cols 21-22: the nose's center (still at cols 21-22!)
+- b 4 rows 29-30 cols 45-46: the right eye's pupil
+- c 18 rows 63 cols 46-63: the timer
+Wait, where's the white cap? And where's the nose? Let me look. The player is at rows 24-26, cols 20-23, facing down, so the cap should be at row 27, cols 20-23 (white). But I don't see a w node at row 27. The only w node is the background (3920 px).
+Hmm, and the nose's center (b 4) is still at cols 21-22, rows 29-30. But the nose's c part is... I don't see a c node at cols 20-23! There's only c 12 at cols 16-19 (left eye), c 12 at cols 44-47 (right eye).
+Wait, so where did the nose go? Let me reconsider. Before the pickup:
+- c 24 rows 28-31 cols 16-23 (fused left eye + nose)
+- b 4 at cols 17-18 (left eye's pupil)
+- b 4 at cols 21-22 (nose's center)
+After the pickup:
+- c 12 rows 28-31 cols 16-19 (left eye)
+- c 12 rows 28-31 cols 44-47 (right eye)
+- b 4 at cols 17-18 (left eye's pupil)
+- b 4 at cols 21-22 (nose's center)
+- b 4 at cols 45-46 (right eye's pupil)
+- No c at cols 20-23!
+- No w cap at row 27!
+So the nose's c part (cols 20-23) is gone, but the nose's blue center (cols 21-22) is still there?! That's strange. And the white cap is gone too.
+Wait, maybe the nose (c 12 at cols 20-23) got picked up and turned white (w), and is now at row 27 (the cap position) or somewhere. But I don't see a w node other than the background. Let me look more carefully.
+Hmm, actually, wait. Let me reconsider. Maybe the nose got picked up and is being carried, and the carried object is rendered as... Let me check. The player is N 12 at rows 24-26, cols 20-23. If the player is carrying the nose, the nose should be below the player (at the cap position, row 27) or attached to the player.
+Actually, wait. Let me reconsider the pickup mechanism. When I pick up an object, does it:
+(a) Attach to the player's cap (below the player, at row 27), or
+(b) Merge into the player (become part of the N node)?
+Looking at the N node: 12 px at rows 24-26, cols 20-23. That's just the player's body (3 rows × 4 cols = 12). So the nose isn't merged into the N node.
+And there's no w node at row 27. So where's the nose?
+Let me look at the ascii around rows 24-32, cols 14-26 to see what's actually there.
+Actually, wait. Let me reconsider. Maybe the nose got picked up and is now white, and it's at row 27, but the segmentation merged it with... no, the background w is rows 0-62, cols 0-63. If the nose were white at row 27, cols 20-23, it would be inside the background w node (since the background is one big w region). So the nose (if white) would be part of the w 3920 node and not visible as a separate node!
+That's it. The background is w (light gray). If the picked-up nose turned white (w), it would blend into the background and not appear as a separate node. So I can't see it in the segmentation.
+Let me check the ascii at rows 27-31, cols 16-24 to see if there's a white nose at row 27.
+Actually, wait. Let me reconsider the colors. The background is w (light gray). The player's cap is also white (w). So the cap blends into the background too! That's why I never see the cap as a separate node. The cap is w, the background is w, so they merge.
+So the cap (w) at row 27, cols 20-23 is part of the background w node. And if the picked-up nose is also w, it's part of the background w node too.
+So I need to look at the ascii to see the actual state. Let me look at rows 24-32, cols 14-26.
+Hmm, but wait. If the nose turned white and is being carried, it should be visible as white against... no, the background is also white (w). So a white nose on a white background is invisible!
+That can't be right. Let me reconsider. Let me look at the ascii.
+Actually, let me reconsider the whole thing. Let me look at the ascii at the relevant region to understand what happened.
+Let me print the ascii at rows 23-33, cols 14-26.
+[ASSISTANT TOOL CALL: python]
+id: chatcmpl-tool-84fab20bdc96345b
+<tool_call>
+<function=python>
+<parameter=code>
+a=current_frame.ascii.split('\n')
+for r in range(23,34):
+    print(r, a[r][14:27])
+</parameter>
+</function>
+</tool_call>
+
+[TOOL RESULT: chatcmpl-tool-84fab20bdc96345b]
+23 wwwwwwwwwwwww
+24 wwwwwwNNNNwww
+25 wwwwwwNNNNwww
+26 wwwwwwNNNNwww
+27 wwwwwwWWWWwww
+28 wwccccWWWWwww
+29 wwcbbcWbbWwww
+30 wwcbbcWbbWwww
+31 wwccccWWWWwww
+32 wwwwwwwwwwwww
+33 wwwwwwwwwwwww
+
+[USER]
+The code executed 9 actions in the previous sequence.
+Executed actions: ACTION1, ACTION3, ACTION3, ACTION3, ACTION3, ACTION3, ACTION3, ACTION2, ACTION5.
+You are still on the same level.
+Current state: step 58, level 1.
+Valid actions right now: ACTION1, ACTION2, ACTION3, ACTION4, ACTION5.
+Only tool: `python`. It receives `current_frame`, `previous_frame`, `history`, `transitions`, `last_transition`, `valid_actions`, `last_action_result`, `runtime_memory`, `telemetry`, `ledger`, `ledger_validation`, `execution_ledger`, `world_model_ledger`, `verification_ledger`, `coverage_ledger`, `hypotheses`, `level_transition`, `last_action_in_valid_action`, `record_hypothesis(...)`, and `action(actions)`.
+Only letter-coded board views and lightweight metadata are exposed; raw numeric color IDs are not available.
+Keep tool output compact: use `current_frame.segmentation` as the primary view, and `current_frame.ascii` only for a small specific region; never print full boards.
+For the most recent change, compare `previous_frame` to `current_frame`, or `last_transition.before_frame` to `last_transition.after_frame`; `history[-1].frame` is the current frame, not the previous one.
+Use Python to inspect the evidence, refine that world model from the newest history, and search or score candidate actions or short sequences against the current goal as you currently understand it.
+Use the structured ledger for authoritative facts and evidence: action meanings are learned per game by default, while availability, target, and preconditions can vary by level or state. Interface hints are priors, not facts.
+Treat `last_action_result`, `execution_ledger`, and `runtime_memory.telemetry` as authoritative transition evidence. Distinguish not-advertised, adapter/parameter/engine failure, executed no-observable-change, observable change, task progress, and terminal failure.
+Model combinations as causal action sequences, not labels: write target Y, prerequisite state X, action order, expected transition after each step, and evidence. A step can be useful preparation even when it gives no immediate reward. Reuse tested sequences only in matching state context; reject unchanged retries that previously failed.
+Free-text working notes below are optional and non-authoritative; revise them when useful, while recording testable claims and observable predictions in `record_hypothesis(...)`.
+You may call `action(actions)` more than once in one Python snippet if your search or control loop needs it, but stop immediately if a result reports `game_over`, `run_complete`, `level_completed`, or `done`.
+Working world model carried from earlier turns:
+- World model: The face-like scene on a light gray background: two charcoal-colored boxes with blue pupils (eyes) at (24-27, 44-47) and (28-31, 16-19), a blue bar with a gray fill (mouth) at (28-31, 28-39), a charcoal-colored box with a blue center at (36-39, 32-35), a green block with a white cap at (48-51, 32-35), and a pink full-width strip at row 63 (probably a timer/HUD). Only ACTION1-5 are available (no coordinate clicks).
+- Goal model: align all parts / all blue centers into the row band at rows 28–31 (the nose is already merged into the left eye at that height, and the mouth is there too). Only the right eye (rows 24–27) is misaligned → move it down by 4.
+- Plan: move up 4 (to get above the eye's row), rotate down (the cap touches the top edge of the eye), pick up, move down 4, drop. First execute the positioning + pickup, then verify.
+- Revise any item above immediately if `current_frame` or `history` contradicts it.
+end of optional working notes. 
+Focus on what changed most recently in `history`, update the target environment change if needed, and separate gameplay-object changes from HUD-only changes.
+When ready, call `action(actions)` from inside the `python` tool with the best valid action or ordered batch selected by your code. If your code has found a reliable short sequence, prefer batching it in one call.
+You may call `action(actions)` more than once in one Python snippet if your search or control loop needs it.
+If you include assistant text before a tool call, keep it short and use it to update the world model. Helpful optional prefixes are `World model:`, `Goal model:`, `Action model:`, `Recent findings:`, `Open questions:`, `Plan:`, and `Cross-level notes:`.
+When calling `python`, emit exactly the tool-call format shown elsewhere in this prompt for this model. Use only that format; do not add markdown fences, prose wrappers, or alternate tool-call syntax. Do not quote or place tool-call markup inside explanatory text; when you decide to call the tool, emit the tool call itself.
+Current grid image:
+
+[TURN TRANSCRIPT SO FAR]
+--- analysis_step=19 | action=58 | 17:35:17 | tool-agent ---
+[SYSTEM PROMPT]
+You are a coding agent solving a grid-based puzzle game.
+
+Game overview:
+- You are solving a multi-level grid puzzle game. 
+- You are called repeatedly over the course of a run. Treat each turn as one observe-plan-act cycle: re-understand the current state from the newest frame, update your working world model in Python, choose the next best action or short sequence against the goal as currently understood, execute it, and expect to re-evaluate on the next turn from the updated state.
+- Your job is to solve the entire game by clearing every level, not just the current screen.
+- An action's learned meaning normally persists across levels of the same game. Availability, target, and preconditions may still vary by level; create a level-specific semantic override only after contradictory evidence.
+- Across different games, learned action meanings reset to hypotheses; only the standardized interface contract transfers.
+- Optimize for as few in-game actions as possible while still being reliable.
+- In this environment, boards are presented as 64 x 64 color grids rendered with ARC color symbols.
+- Color legend: W=white, w=light gray, g=gray, G=dark gray, c=charcoal, B=black, M=magenta, P=pink, R=red, b=blue, S=sky blue, Y=yellow, O=orange, r=dark red, N=light green, p=purple.
+
+
+Runtime variables inside every `python` tool call:
+- `current_frame` is a lightweight frame view for the latest environment state.
+- `current_frame` exposes only `.ascii`, `.step`, `.level`, `.shape`, and `.segmentation`.
+- `current_frame.ascii` is a single newline-delimited string containing the latest board rendered with the letter-coded ARC color symbols.
+- `current_frame.segmentation` parses the board into objects. It returns `{'nodes': [...], 'adjacency_list': [...]}`.
+- Each node in `segmentation['nodes']` is one 4-connected same-color object with: `id` (index, ordered top-most-left-most), `color` (ARC color character), `hash` (a signature of the object's color and shape that ignores its position -- equal hashes mean the same object regardless of where it is, so use it to track an object across frames or to spot multiple identical objects in one frame), `pixels` (cell count), `boundary` (clockwise outer-perimeter corner points as `[row, col]`), and `children` (ids of objects fully enclosed by this one).
+- `segmentation['adjacency_list']` is a list of `[i, j]` node-id pairs whose objects share an edge.
+- `current_frame.step` is the current environment step count.
+- `current_frame.level` is the current level number.
+- `current_frame.shape` is a `(rows, cols)` tuple.
+- The raw numeric grid is intentionally not exposed. Use `current_frame.segmentation` as your primary view of the board -- objects, colors, shapes, containment, adjacency, and cross-frame object hashes. Use `current_frame.ascii` only to read a small, specific region; do not scan the whole board with it.
+- `history` is a chronological list of action/frame snapshots.
+- `history` is a Python list of objects, not a dict.
+- Each history entry exposes only `.action` and `.frame`; entries are not subscriptable like `entry['action']`.
+- Each `history[i].frame` is the frame after `history[i].action`; each frame exposes only `.ascii`, `.step`, `.level`, `.shape`, and `.segmentation`.
+- Important history semantics: when `history` is non-empty, `history[-1].frame` is the same latest/post-action board as `current_frame`. It is not the previous board. To inspect the state before the latest action, use `previous_frame` or `history[-2].frame` when available.
+- `previous_frame` is the frame before the most recent real environment action, or `None` if no previous frame is available.
+- `last_action` is the most recent real environment action name/display, or `None` before any real action.
+- `last_action_frame` is the post-action frame for `last_action`; it matches `current_frame` after a real action.
+- `transitions` is a chronological list of actual action transitions, excluding the initial seeded frame. Each transition exposes `.action`, `.before_frame`, `.after_frame`, `.frame` (alias of `.after_frame`), and `.result`.
+- `last_transition` is `transitions[-1]` or `None`. Its `.result` mirrors `last_action_result`; older transitions may have an empty `.result`. For before/after diffs, compare `last_transition.before_frame` to `last_transition.after_frame`; do not compare `current_frame` to `history[-1].frame`.
+- `last_action_result` is the persisted result dict from the most recent `action(...)` call. It remains available across later Python inspection calls that do not call `action(...)`, and is `{}` before any action result exists. Read transition metadata from fields/keys such as `last_action_result['board_changed']`, `last_action_result['done']`, `last_action_result['level_completed']`, `last_action_result['game_over']`, `last_action_result['run_complete']`, `last_action_result['reward']`, and `last_action_result['valid_actions']`.
+- `last_action_in_valid_action` reports whether the most recent action was legal under the valid-action list before it ran.
+- `telemetry` contains recent observation hashes, task/observable progress streaks, HUD/gameplay change classification, and changed-cell samples. An observation hash is not proof of complete latent-state identity.
+- `telemetry['task_no_progress_streak']` counts actions without engine task progress; `observable_no_change_streak` counts unchanged observations; `repeated_action_streak` counts identical displayed actions.
+- `level_transition` contains the last two frames and last five actions around the most recent level transition when one occurred.
+- `ledger` is the compact authoritative Inform view. `execution_ledger`, `world_model_ledger`, `verification_ledger`, and `coverage_ledger` expose its structured components; free prose is non-authoritative.
+- `ledger_validation` reports semantic-schema invariant failures without silently coercing or deleting evidence.
+- `hypotheses` contains structured candidates and predictions. Facts are separate from hypotheses, and unexecuted requests are never no-op evidence.
+- Record a probe with `record_hypothesis({...})` (alias `record_expectation`). Prefer fields `kind`, canonical `action` or `action_sequence`, `claim`, `scope`, `target_binding`, `preconditions`, and observable `predictions` such as `{'field':'object_changes.moved','op':'nonempty'}`.
+- A descriptive effect without an observable predicate is preserved but verifies as inconclusive, not supported or refuted.
+- `valid_actions` is the current list of advertised canonical action IDs. Not advertised, rejected, unexecuted, and executed-with-no-observable-change are distinct outcomes.
+- Call `action(actions)` to execute one or more real environment actions from Python.
+- Pass `action(actions)` a list like `['ACTION3']` or `[{'action': 'ACTION6', 'row': 4, 'col': 7}]`.
+- One action usually returns one frame, but a single action can result in a short multi-frame animation.
+- After `action(actions)` returns, `current_frame`, `previous_frame`, `history`, `transitions`, `valid_actions`, and `last_action_result` are refreshed.
+
+
+Multimodal context:
+- User turns include an attached image of the current ARC grid.
+- The image and `current_frame.ascii` are two representations of the same current frame.
+- You can use images and other tools to understand the game state and guide your strategy, each may be useful depending on the current uncertainty.
+
+
+Visual-game guidance:
+- Treat each board as a scene with objects, blockers, targets, adjacency, containment, motion, and symmetry.
+- Game entities are usually be rendered as connected multi-tile shapes such as 2×2, 2×3, 3×3, or longer patterned structures. Sometime they might also be 1x1 tokens.- Some games are logic or layout puzzles with no explicit player avatar or controllable sprite on the board. Do not assume a player exists; the relevant state may be an object, region, cursor, selector, or whole-board configuration.
+- Background colors are often white or gray/black-ish large regions, but not always. Verify background hypotheses by area, stability, and object boundaries rather than assuming them.
+- In many games, a long horizontal or vertical line near an edge is a timer or remaining-steps bar. It often shrinks or changes each step. If you identify such a bar, do not get distracted by it or treat it as core gameplay state unless there is concrete evidence that it interacts with the puzzle mechanics.
+A common failure mode is to mistake a segmented edge bar for clickable puzzle pieces. If a repeated strip of small blocks sits flush against the top, bottom, left, or right border and actions only change that strip while the interior board stays the same, classify it as HUD/timer state, not as an object to click through segment by segment. DON'T DO THIS!
+- Use coordinates only to target actions or describe local evidence. Do not frame the objective as reaching a specific absolute row or column.
+- Re-ground on the newest frame after any score increase or abrupt scene change; the returned board may already be the next level.
+- `WIN` means the whole game is solved. Mid-run level completion is more likely to appear as a score increase while play continues.
+- Strategies may transfer loosely across levels, but layouts and mechanics can change. Re-check the new board before repeating a plan.
+- `ACTION1`...`ACTION7` are canonical engine IDs, not semantic facts. Direction/interaction labels are interface priors only.
+- For coordinate action `ACTION6`, pass `row` and `col` integer arguments. `row` is vertical position, `col` is horizontal position.
+
+
+Python tool guidance:
+- Use `current_frame.segmentation` as your primary view of the board -- objects, colors, containment, adjacency, and cross-frame object hashes.
+- Use `current_frame.ascii` only to read a small, specific region of the board when `segmentation` is not enough; never use it to scan or summarize the whole board.
+- Every `python` tool call starts fresh. Re-import modules or re-define any custom utility logic you need.
+- The only importable standard-library modules are: bisect, collections, copy, fractions, functools, heapq, itertools, json, math, operator, random, re, statistics, string.
+- The only tool is `python`; call it with one ephemeral `code` string.
+- Always inspect `current_frame`, `history`, and `valid_actions` from Python instead of reasoning from the raw board by eye.
+- For the most recent change, compare `previous_frame` to `current_frame`, or `last_transition.before_frame` to `last_transition.after_frame`. `history[-1].frame` is the current frame, so comparing it to `current_frame` only compares the board to itself.
+- Maintain candidate object roles, per-game action functions, object-action affordances, preconditions, completion-condition hypotheses, and explicit unknown coverage. The only fixed objective is to complete the whole game (`WIN`).
+- IMPORTANT: Especially when the game is about making an agent navigate to a target, it is usually safer to write an explicit search algorithm such as BFS. More generally, when the objective is understood but the best action order is unclear, pathfinding, flood fill, BFS, DFS, beam search, shortest-path search, limited action-sequence search, or custom heuristics are all valid.
+- Optimize for the shortest reliable sequence that advances the current goal as described by your world model. If confidence is low, program a discriminating probe and revise the world model from the result.
+- Once the important state variables and action effects are sufficiently understood, stop probing and search in the inferred state space.
+- Inspect current and history frames from Python instead of describing frames freehand.
+- Never print or echo full board frames. Return only compact derived summaries such as object lists, diffs, coordinates, counts, or tiny local crops.
+- Keep tool-output context size minimal and decision-oriented so you can quickly compare before/after state. It's fine to write a lot of python code, just make the output short and interpretable
+- A strong default loop is: summarize the board, infer the desired environment change, write a small scorer or search over candidate sequences, execute the best probe or plan with `action(...)`, then inspect again until you understand exactly what changed.
+- For object tracking, match objects by color, overlap, bounding box proximity, area change, and edge contact rather than by exact coordinates alone.
+- For frame diffs, summarize changed cells, color transitions, appearing/disappearing components, movement candidates, and small local row slices around the changed region.
+- After every action, verify whether gameplay objects changed or whether only a timer, progress bar, or remaining-step bar moved. Do not treat HUD-only changes as evidence that the move worked.
+- Streaks are evidence, not automatic stop rules. Repeating one action is allowed when the world model predicts a useful intermediate state or required displacement.
+- Learn action patterns, not isolated moves: record short tested sequences such as `X -> U` and their precondition, observed effect, cost, and outcome. Do not call a sequence a combination until each step's effect and ordering are supported by transitions.
+- Treat plans as causal prerequisites: define target outcome `Y`, identify prerequisite state `X`, test `X`, then test `Y`; preserve ordering when `Y` fails without `X` and succeeds after `X`. A repeated or zero-progress prefix may still be necessary preparation.
+- When a tested pattern does not improve the goal, mark that pattern/state-context as weak or rejected and avoid retrying the same pattern unchanged. Retry only with changed state, changed parameters, or a new causal hypothesis.
+- Use `print(...)` for compact summaries, or assign a final compact object to `result`.
+- Call `action(...)` inside Python rather than returning action text in the chat.
+- `action(...)` accepts an ordered list of one or more actions. Once your code has selected a reliable sequence, it is often useful to batch it.
+- You can also call `action(...)` multiple times in one Python snippet, including inside loops. Each call updates the preloaded variables before execution continues.
+- If an action result reports `game_over`, `run_complete`, `level_completed`, or `done`, stop acting immediately and re-ground on the next turn.
+
+
+Tool session rules:
+- You have exactly one tool: `python`.
+- When calling `python`, emit exactly the tool-call format shown elsewhere in this prompt for this model. Use only that format; do not add markdown fences, prose wrappers, or alternate tool-call syntax. Do not quote or place tool-call markup inside explanatory text; when you decide to call the tool, emit the tool call itself.
+- The `python` tool code is not saved between calls, so rewrite any custom utility logic you still need.
+- You can call the `python` tool as many times as you want per step. Investigate until your code has a clear probe or plan.
+- Do not ration tool calls when the state is unclear. Spend extra tool calls to confirm what changed between frames and whether the last action affected gameplay state or only HUD elements such as countdown bars.
+- After `action(...)` returns, the structured runtime state is refreshed before the next Python statement and before the next tool call. Inspection-only Python calls do not clear `last_action_result`.
+- Each `python` tool call has a hard time limit of 30 seconds.
+- Tool responses are capped to about 2048 tokens. If a response is cut off, the tool result will tell you that.
+- Keep code snippets short and purpose-built rather than dumping large frameworks into one call.
+
+[USER PROMPT]
+The code executed 9 actions in the previous sequence.
+Executed actions: ACTION1, ACTION3, ACTION3, ACTION3, ACTION3, ACTION3, ACTION3, ACTION2, ACTION5.
+You are still on the same level.
+Current state: step 58, level 1.
+Valid actions right now: ACTION1, ACTION2, ACTION3, ACTION4, ACTION5.
+Only tool: `python`. It receives `current_frame`, `previous_frame`, `history`, `transitions`, `last_transition`, `valid_actions`, `last_action_result`, `runtime_memory`, `telemetry`, `ledger`, `ledger_validation`, `execution_ledger`, `world_model_ledger`, `verification_ledger`, `coverage_ledger`, `hypotheses`, `level_transition`, `last_action_in_valid_action`, `record_hypothesis(...)`, and `action(actions)`.
+Only letter-coded board views and lightweight metadata are exposed; raw numeric color IDs are not available.
+Keep tool output compact: use `current_frame.segmentation` as the primary view, and `current_frame.ascii` only for a small specific region; never print full boards.
+For the most recent change, compare `previous_frame` to `current_frame`, or `last_transition.before_frame` to `last_transition.after_frame`; `history[-1].frame` is the current frame, not the previous one.
+Use Python to inspect the evidence, refine that world model from the newest history, and search or score candidate actions or short sequences against the current goal as you currently understand it.
+Use the structured ledger for authoritative facts and evidence: action meanings are learned per game by default, while availability, target, and preconditions can vary by level or state. Interface hints are priors, not facts.
+Treat `last_action_result`, `execution_ledger`, and `runtime_memory.telemetry` as authoritative transition evidence. Distinguish not-advertised, adapter/parameter/engine failure, executed no-observable-change, observable change, task progress, and terminal failure.
+Model combinations as causal action sequences, not labels: write target Y, prerequisite state X, action order, expected transition after each step, and evidence. A step can be useful preparation even when it gives no immediate reward. Reuse tested sequences only in matching state context; reject unchanged retries that previously failed.
+Free-text working notes below are optional and non-authoritative; revise them when useful, while recording testable claims and observable predictions in `record_hypothesis(...)`.
+You may call `action(actions)` more than once in one Python snippet if your search or control loop needs it, but stop immediately if a result reports `game_over`, `run_complete`, `level_completed`, or `done`.
+Working world model carried from earlier turns:
+- World model: The face-like scene on a light gray background: two charcoal-colored boxes with blue pupils (eyes) at (24-27, 44-47) and (28-31, 16-19), a blue bar with a gray fill (mouth) at (28-31, 28-39), a charcoal-colored box with a blue center at (36-39, 32-35), a green block with a white cap at (48-51, 32-35), and a pink full-width strip at row 63 (probably a timer/HUD). Only ACTION1-5 are available (no coordinate clicks).
+- Goal model: align all parts / all blue centers into the row band at rows 28–31 (the nose is already merged into the left eye at that height, and the mouth is there too). Only the right eye (rows 24–27) is misaligned → move it down by 4.
+- Plan: move up 4 (to get above the eye's row), rotate down (the cap touches the top edge of the eye), pick up, move down 4, drop. First execute the positioning + pickup, then verify.
+- Revise any item above immediately if `current_frame` or `history` contradicts it.
+end of optional working notes. 
+Focus on what changed most recently in `history`, update the target environment change if needed, and separate gameplay-object changes from HUD-only changes.
+When ready, call `action(actions)` from inside the `python` tool with the best valid action or ordered batch selected by your code. If your code has found a reliable short sequence, prefer batching it in one call.
+You may call `action(actions)` more than once in one Python snippet if your search or control loop needs it.
+If you include assistant text before a tool call, keep it short and use it to update the world model. Helpful optional prefixes are `World model:`, `Goal model:`, `Action model:`, `Recent findings:`, `Open questions:`, `Plan:`, and `Cross-level notes:`.
+When calling `python`, emit exactly the tool-call format shown elsewhere in this prompt for this model. Use only that format; do not add markdown fences, prose wrappers, or alternate tool-call syntax. Do not quote or place tool-call markup inside explanatory text; when you decide to call the tool, emit the tool call itself.
+
+[ANALYZER STATUS]
+request_error: HTTPConnectionPool(host='127.0.0.1', port=1234): Read timed out. (read timeout=130.30579345300066)
