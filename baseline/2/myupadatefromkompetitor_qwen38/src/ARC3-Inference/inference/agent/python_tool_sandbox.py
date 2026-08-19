@@ -202,8 +202,12 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
         return items
 
 
-    def _transitions_from_history(history, last_action_result):
+    def _transitions_from_history(history, last_action_result, ledger_transitions=None):
         transitions = []
+        recorded_results = [
+            dict(item) for item in (ledger_transitions or []) if isinstance(item, dict)
+        ]
+        result_offset = max(0, len(recorded_results) - max(0, len(history) - 1))
         for index, entry in enumerate(history):
             action = str(getattr(entry, "action", "") or "").strip()
             if not action:
@@ -214,7 +218,11 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
                     action=action,
                     before_frame=before_frame,
                     after_frame=entry.frame,
-                    result={},
+                    result=(
+                        recorded_results[result_offset + len(transitions)]
+                        if result_offset + len(transitions) < len(recorded_results)
+                        else {}
+                    ),
                 )
             )
         if transitions and isinstance(last_action_result, dict):
@@ -293,9 +301,9 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
                 if not action_name:
                     raise ValueError(f"Action {index} is missing an `action` field.")
                 entry = {"action": action_name}
-                if action_name.upper() == "MOUSE" and ("x" in item or "y" in item):
+                if action_name.upper() in {"MOUSE", "ACTION6"} and ("x" in item or "y" in item):
                     raise ValueError(
-                        f"Action {index} uses legacy MOUSE x/y fields; use row and col."
+                        f"Action {index} uses legacy ACTION6 x/y fields; use row and col."
                     )
                 if "row" in item:
                     entry["row"] = item.get("row")
@@ -335,7 +343,17 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
             action_result = (
                 dict(last_action_result) if isinstance(last_action_result, dict) else {}
             )
-            transitions = _transitions_from_history(history, action_result)
+            runtime_memory = state_payload.get("runtime_memory")
+            runtime_memory = runtime_memory if isinstance(runtime_memory, dict) else {}
+            full_ledger = runtime_memory.get("ledger")
+            full_ledger = full_ledger if isinstance(full_ledger, dict) else {}
+            execution = full_ledger.get("execution")
+            execution = execution if isinstance(execution, dict) else {}
+            transitions = _transitions_from_history(
+                history,
+                action_result,
+                execution.get("transitions", []),
+            )
             last_transition = transitions[-1] if transitions else None
 
             runtime_globals["current_frame"] = current_frame
@@ -352,12 +370,24 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
             runtime_globals["last_action"] = last_transition.action if last_transition is not None else None
             runtime_globals["valid_actions"] = [str(item) for item in state_payload.get("valid_actions", [])]
             runtime_globals["last_action_result"] = action_result
-            runtime_memory = state_payload.get("runtime_memory")
-            runtime_globals["runtime_memory"] = runtime_memory if isinstance(runtime_memory, dict) else {}
+            runtime_globals["runtime_memory"] = runtime_memory
             telemetry = runtime_globals["runtime_memory"].get("telemetry", {})
             runtime_globals["telemetry"] = telemetry if isinstance(telemetry, dict) else {}
-            runtime_globals["hypotheses"] = runtime_globals["runtime_memory"].get("hypotheses", [])
+            world_model = full_ledger.get("world_model")
+            world_model = world_model if isinstance(world_model, dict) else {}
+            runtime_globals["hypotheses"] = world_model.get(
+                "hypotheses", runtime_globals["runtime_memory"].get("hypotheses", [])
+            )
             runtime_globals["level_transition"] = runtime_globals["runtime_memory"].get("level_transition", {})
+            runtime_globals["ledger"] = runtime_globals["runtime_memory"].get("ledger_inform", {})
+            runtime_globals["ledger_validation"] = runtime_globals["runtime_memory"].get(
+                "ledger_validation", {}
+            )
+            runtime_globals["ledger_full"] = full_ledger
+            runtime_globals["execution_ledger"] = execution
+            runtime_globals["world_model_ledger"] = world_model
+            runtime_globals["verification_ledger"] = full_ledger.get("verification", {})
+            runtime_globals["coverage_ledger"] = full_ledger.get("coverage", {})
             recent = runtime_globals["telemetry"].get("transitions", [])
             runtime_globals["last_action_in_valid_action"] = bool(
                 recent[-1].get("last_action_in_valid_action") if recent else False
@@ -383,10 +413,13 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
             reply = _recv()
             if reply.get("type") != "expectation_result":
                 raise RuntimeError("Invalid expectation response from sandbox host.")
+            if isinstance(reply.get("state"), dict):
+                _refresh_state(reply.get("state") or {})
             return reply.get("expectation")
 
         runtime_globals["action"] = action
         runtime_globals["record_expectation"] = record_expectation
+        runtime_globals["record_hypothesis"] = record_expectation
         _refresh_state(initial.get("state") or {})
 
         try:
@@ -452,17 +485,23 @@ def _kill_process_group(process: subprocess.Popen[str]) -> None:
 
 def _wait_for_process_exit(process: subprocess.Popen[str], *, timeout: float = 1.0) -> None:
     try:
-        process.wait(timeout=timeout)
-        return
-    except subprocess.TimeoutExpired:
-        _kill_process_group(process)
-    except OSError:
-        return
-
-    try:
-        process.wait(timeout=timeout)
-    except (subprocess.TimeoutExpired, OSError):
-        pass
+        try:
+            process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            _kill_process_group(process)
+            try:
+                process.wait(timeout=timeout)
+            except (subprocess.TimeoutExpired, OSError):
+                pass
+        except OSError:
+            pass
+    finally:
+        for stream in (process.stdin, process.stdout, process.stderr):
+            if stream is not None:
+                try:
+                    stream.close()
+                except OSError:
+                    pass
 
 
 def run_sandboxed_python(
@@ -583,7 +622,18 @@ def run_sandboxed_python(
             if msg_type == "expectation":
                 expectation = message.get("expectation")
                 result = expectation_handler(expectation) if expectation_handler is not None else expectation
-                _send_json_line(process.stdin, {"type": "expectation_result", "expectation": result})
+                refreshed_state = None
+                if (
+                    isinstance(result, dict)
+                    and isinstance(result.get("state"), dict)
+                    and "expectation" in result
+                ):
+                    refreshed_state = result.get("state")
+                    result = result.get("expectation")
+                response = {"type": "expectation_result", "expectation": result}
+                if refreshed_state is not None:
+                    response["state"] = refreshed_state
+                _send_json_line(process.stdin, response)
                 continue
 
             if msg_type in {"final", "error"}:

@@ -33,10 +33,23 @@ from inference.agent.runtime_state import (
     Frame,
     HistoryEntry,
     RUNTIME_STATE_FILENAME,
-    frame_state_hash,
-    apply_transition_to_hypotheses,
+    frame_observation_hash,
+    load_runtime_memory,
     transition_observation,
     write_runtime_state,
+)
+from inference.agent.epistemic_ledger import (
+    classify_executed_outcome,
+    ensure_ledger,
+    finalize_incomplete_sequence_hypotheses,
+    new_ledger,
+    next_sequence_id,
+    observe_action_availability,
+    record_action_attempt,
+    record_sequence,
+    ledger_validation_report,
+    sync_legacy_hypotheses,
+    verify_open_hypotheses,
 )
 from inference.agent.tool_agent import ToolAgent
 from inference.framework.kaggle import (
@@ -136,7 +149,7 @@ def _format_action_display(
 ) -> str:
     if action_name == "ACTION6":
         data = _model_mouse_action_data(action_data)
-        return f"MOUSE(row={data['row']}, col={data['col']})"
+        return f"ACTION6(row={data['row']}, col={data['col']})"
     return to_model_action(action_name)
 
 
@@ -189,6 +202,7 @@ class _HarnessGameSession:
     telemetry: dict[str, Any] = field(default_factory=dict)
     hypotheses: list[dict[str, Any]] = field(default_factory=list)
     level_transition: dict[str, Any] = field(default_factory=dict)
+    ledger: dict[str, Any] = field(default_factory=new_ledger)
     _viewer_events_flushed: int = field(default=0, init=False, repr=False)
 
     def current_frame(self) -> Frame:
@@ -206,7 +220,36 @@ class _HarnessGameSession:
             telemetry=self.telemetry,
             hypotheses=self.hypotheses,
             level_transition=self.level_transition,
+            ledger=self.ledger,
         )
+        self.write_ledger_artifact()
+
+    def ledger_artifact_path(self) -> Path:
+        runtime_stem = Path(RUNTIME_STATE_FILENAME).stem
+        suffix = f"_{runtime_stem}"
+        state_stem = self.state_path.stem
+        game_stem = state_stem[:-len(suffix)] if state_stem.endswith(suffix) else state_stem
+        if self.state_path.parent.name == "artifacts":
+            return self.state_path.parent.parent / "ledgers" / f"{game_stem}_epistemic_ledger.json"
+        return self.state_path.with_name(f"{game_stem}_epistemic_ledger.json")
+
+    def write_ledger_artifact(self) -> None:
+        if self.solver.job_dir is None:
+            return
+        path = self.ledger_artifact_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        run = self.game.game_run
+        payload = {
+            "game_id": run.game_id if run is not None else str(self.game_index),
+            "pass_index": self.pass_index,
+            "level": self.current_frame().level,
+            "action_count": self.action_count,
+            "validation": ledger_validation_report(self.ledger),
+            "ledger": self.ledger,
+        }
+        tmp_path = path.with_suffix(f"{path.suffix}.tmp")
+        tmp_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        tmp_path.replace(path)
 
     def seed_initial_history(self) -> None:
         if not self.history_entries:
@@ -214,10 +257,40 @@ class _HarnessGameSession:
                 HistoryEntry(action="", frame=self.current_frame())
             )
         self.telemetry.setdefault("action_count", 0)
+        self.telemetry.setdefault("task_no_progress_streak", 0)
+        self.telemetry.setdefault("observable_no_change_streak", 0)
         self.telemetry.setdefault("no_progress_streak", 0)
         self.telemetry.setdefault("repeated_action_streak", 0)
+        self.telemetry.setdefault("observation_hashes", [])
         self.telemetry.setdefault("state_hashes", [])
         self.telemetry.setdefault("transitions", [])
+        initial_hash = frame_observation_hash(self.current_frame())
+        if initial_hash and not self.telemetry["observation_hashes"]:
+            self.telemetry["observation_hashes"] = [initial_hash]
+            self.telemetry["state_hashes"] = [initial_hash]
+        run = self.game.game_run
+        game_id = run.game_id if run is not None else str(self.game_index)
+        self.ledger = ensure_ledger(self.ledger, game_id=game_id)
+        observe_action_availability(
+            self.ledger,
+            level=self.current_frame().level,
+            advertised_actions=_engine_action_names(self.game),
+            step=self.action_count,
+        )
+        self.hypotheses = sync_legacy_hypotheses(self.ledger)
+
+    def sync_runtime_memory_from_disk(self) -> None:
+        """Accept model-authored hypotheses before the next environment action."""
+
+        if not self.state_path.exists():
+            return
+        memory = load_runtime_memory(self.state_path)
+        self.telemetry = dict(memory.get("telemetry") or self.telemetry)
+        self.level_transition = dict(memory.get("level_transition") or self.level_transition)
+        run = self.game.game_run
+        game_id = run.game_id if run is not None else str(self.game_index)
+        self.ledger = ensure_ledger(memory.get("ledger"), game_id=game_id)
+        self.hypotheses = sync_legacy_hypotheses(self.ledger)
 
     @property
     def action_count(self) -> int:
@@ -348,6 +421,7 @@ class _HarnessGameSession:
             if run.solver_note is None:
                 run.solver_note = f"tokens={total_tokens}"
             self._finish_if_needed()
+            self.write_ledger_artifact()
             self.state_path.unlink(missing_ok=True)
             self._write_analysis_html()
             self.write_viewer_payload()
@@ -449,6 +523,9 @@ class _HarnessGameSession:
                 "level_completed": payload.get("level_completed"),
                 "game_over": payload.get("game_over"),
                 "run_complete": payload.get("run_complete"),
+                "outcome": payload.get("outcome"),
+                "attempt_id": payload.get("attempt_id"),
+                "information_gain": payload.get("information_gain"),
                 "telemetry": payload.get("telemetry"),
                 "last_action_in_valid_action": payload.get("last_action_in_valid_action"),
                 "no_progress_streak": payload.get("no_progress_streak"),
@@ -484,6 +561,9 @@ class _HarnessGameSession:
             "lastEvent": last_event,
             "viewer_steps": [],
             "replay_url": self.analysis_html_relpath,
+            "ledger_url": os.path.relpath(self.ledger_artifact_path(), self.solver.job_dir)
+            if self.solver.job_dir is not None
+            else None,
         }
         if run is not None:
             payload.update(
@@ -541,7 +621,13 @@ class _HarnessGameSession:
                     None,
                     f"Unknown action at index {index}: {raw_action.get('action')!r}",
                 )
-            action_id = arcengine.GameAction.from_name(action_name)
+            try:
+                action_id = arcengine.GameAction.from_name(action_name)
+            except Exception:
+                return (
+                    None,
+                    f"Engine adapter does not expose canonical action {action_name!r} at index {index}.",
+                )
             data: dict[str, Any] = {}
             if action_id == arcengine.GameAction.ACTION6:
                 try:
@@ -554,21 +640,79 @@ class _HarnessGameSession:
                 except (KeyError, TypeError, ValueError):
                     return (
                         None,
-                        f"MOUSE action at index {index} requires integer row and col arguments.",
+                        f"ACTION6 at index {index} requires integer row and col arguments.",
                     )
             actions.append(arcengine.ActionInput(id=action_id, data=data))
         return actions, None
 
-    def _error_payload(self, message: str) -> dict[str, Any]:
-        return {
+    def _raw_requested_actions(self, arguments: dict[str, Any]) -> list[dict[str, Any]]:
+        raw = arguments.get("actions")
+        if isinstance(raw, list):
+            return [dict(item) if isinstance(item, dict) else {"action": item} for item in raw]
+        if str(arguments.get("action", "")).strip():
+            return [{
+                "action": arguments.get("action"),
+                "row": arguments.get("row"),
+                "col": arguments.get("col"),
+            }]
+        return []
+
+    def _record_nonexecuted_attempt(
+        self,
+        *,
+        requested_action: str | None,
+        action_data: dict[str, Any] | None,
+        outcome: str,
+        error: str,
+        sequence_id: str,
+        batch_index: int | None,
+    ) -> dict[str, Any]:
+        frame = self.current_frame()
+        attempt = record_action_attempt(
+            self.ledger,
+            requested_action=requested_action,
+            action_id=to_engine_action(requested_action),
+            action_data=action_data,
+            level=frame.level,
+            step=frame.step,
+            observation_hash_before=frame_observation_hash(frame),
+            advertised_actions=_engine_action_names(self.game),
+            outcome=outcome,
+            executed=False,
+            error=error,
+            sequence_id=sequence_id,
+            batch_index=batch_index,
+        )
+        self.hypotheses = sync_legacy_hypotheses(self.ledger)
+        self.write_runtime_state()
+        return attempt
+
+    def _error_payload(
+        self,
+        message: str,
+        *,
+        outcome: str = "parameter_invalid",
+        attempt: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        payload = {
             "executed": False,
+            "observed": False,
+            "outcome": outcome,
             "error": message,
             "valid_actions": to_model_actions(_engine_action_names(self.game)),
+            "board_changed": None,
             **self.timing_payload(),
         }
+        if attempt is not None:
+            payload["attempt_id"] = attempt.get("id")
+            payload["information_gain"] = attempt.get("information_gain")
+        return payload
 
     def _terminal_payload(
-        self, requested_actions: list[arcengine.ActionInput]
+        self,
+        requested_actions: list[arcengine.ActionInput],
+        *,
+        attempt_ids: list[str] | None = None,
     ) -> dict[str, Any]:
         raw_state = self.game.current_state.raw.state
         is_game_over = raw_state == arcengine.GameState.GAME_OVER
@@ -582,13 +726,15 @@ class _HarnessGameSession:
         )
         return {
             "executed": False,
+            "observed": False,
+            "outcome": "govern_suppressed",
             "error": "No action was executed because the current game state is terminal or stopping.",
             "action_num": self.action_count,
             "level": _level_number(self.game),
             "score": int(self.game.current_state.levels_completed),
             "state": raw_state.name,
             "valid_actions": [],
-            "board_changed": False,
+            "board_changed": None,
             "done": is_win,
             "level_completed": False,
             "game_over": is_game_over,
@@ -600,15 +746,67 @@ class _HarnessGameSession:
             "executed_actions": [],
             "stopped_early": True,
             "stop_reason": stop_reason,
+            "attempt_ids": list(attempt_ids or []),
             **self.timing_payload(),
         }
 
     def step_env(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        self.sync_runtime_memory_from_disk()
+        sequence_id = next_sequence_id(self.ledger)
+        raw_requests = self._raw_requested_actions(arguments)
         requested_actions, error = self._normalize_actions(arguments)
         if error is not None or requested_actions is None:
-            return self._error_payload(error or "Could not parse action request.")
+            message = error or "Could not parse action request."
+            outcome = (
+                "adapter_unmapped"
+                if message.startswith(("Unknown action", "Engine adapter"))
+                else "parameter_invalid"
+            )
+            raw = raw_requests[0] if raw_requests else {}
+            attempt = self._record_nonexecuted_attempt(
+                requested_action=str(raw.get("action") or "") or None,
+                action_data={key: raw.get(key) for key in ("row", "col") if raw.get(key) is not None},
+                outcome=outcome,
+                error=message,
+                sequence_id=sequence_id,
+                batch_index=1 if raw_requests else None,
+            )
+            record_sequence(
+                self.ledger,
+                sequence_id=sequence_id,
+                requested_actions=[str(item.get("action") or "") for item in raw_requests],
+                attempt_ids=[attempt["id"]],
+                stopped_early=True,
+                stop_reason=outcome,
+            )
+            self.write_runtime_state()
+            return self._error_payload(message, outcome=outcome, attempt=attempt)
         if self.should_stop() or _is_engine_game_over(self.game):
-            return self._terminal_payload(requested_actions)
+            attempt_ids = []
+            for batch_index, action in enumerate(requested_actions, start=1):
+                attempt = self._record_nonexecuted_attempt(
+                    requested_action=action.id.name,
+                    action_data=(
+                        _model_mouse_action_data(dict(action.data))
+                        if action.id == arcengine.GameAction.ACTION6
+                        else dict(action.data)
+                    ),
+                    outcome="govern_suppressed",
+                    error="Current game state is terminal or stopping.",
+                    sequence_id=sequence_id,
+                    batch_index=batch_index,
+                )
+                attempt_ids.append(attempt["id"])
+            record_sequence(
+                self.ledger,
+                sequence_id=sequence_id,
+                requested_actions=[_format_action_display(action.id.name, dict(action.data)) for action in requested_actions],
+                attempt_ids=attempt_ids,
+                stopped_early=True,
+                stop_reason="terminal_state",
+            )
+            self.write_runtime_state()
+            return self._terminal_payload(requested_actions, attempt_ids=attempt_ids)
 
         executed_payloads: list[dict[str, Any]] = []
         total_reward = 0.0
@@ -618,31 +816,95 @@ class _HarnessGameSession:
             _format_action_display(action.id.name, dict(action.data))
             for action in requested_actions
         ]
+        attempt_ids: list[str] = []
+        last_nonexecuted_attempt: dict[str, Any] | None = None
 
         for batch_index, action in enumerate(requested_actions, start=1):
             if self.should_stop():
+                message = "Action was suppressed because the run reached its controller stop condition."
+                last_nonexecuted_attempt = self._record_nonexecuted_attempt(
+                    requested_action=action.id.name,
+                    action_data=(
+                        _model_mouse_action_data(dict(action.data))
+                        if action.id == arcengine.GameAction.ACTION6
+                        else dict(action.data)
+                    ),
+                    outcome="govern_suppressed",
+                    error=message,
+                    sequence_id=sequence_id,
+                    batch_index=batch_index,
+                )
+                attempt_ids.append(last_nonexecuted_attempt["id"])
                 stop_reason = "stopped"
                 break
             if action.id.value not in self.game.current_state.available_actions:
                 message = f"{_format_action_display(action.id.name, dict(action.data))} is not valid right now."
+                attempt = self._record_nonexecuted_attempt(
+                    requested_action=action.id.name,
+                    action_data=(
+                        _model_mouse_action_data(dict(action.data))
+                        if action.id == arcengine.GameAction.ACTION6
+                        else dict(action.data)
+                    ),
+                    outcome="not_advertised",
+                    error=message,
+                    sequence_id=sequence_id,
+                    batch_index=batch_index,
+                )
+                attempt_ids.append(attempt["id"])
                 if executed_payloads:
                     stop_reason = "invalid_action"
                     break
-                return self._error_payload(message)
+                record_sequence(
+                    self.ledger,
+                    sequence_id=sequence_id,
+                    requested_actions=requested_displays,
+                    attempt_ids=attempt_ids,
+                    stopped_early=True,
+                    stop_reason="not_advertised",
+                )
+                self.write_runtime_state()
+                return self._error_payload(message, outcome="not_advertised", attempt=attempt)
 
             try:
                 payload = self._execute_action(
                     action,
                     batch_index=batch_index,
                     batch_size=batch_size,
+                    sequence_id=sequence_id,
                     flush_viewer_payload=False,
                 )
             except Exception as exc:
+                message = f"{type(exc).__name__}: {exc}"
+                attempt = self._record_nonexecuted_attempt(
+                    requested_action=action.id.name,
+                    action_data=(
+                        _model_mouse_action_data(dict(action.data))
+                        if action.id == arcengine.GameAction.ACTION6
+                        else dict(action.data)
+                    ),
+                    outcome="engine_rejected",
+                    error=message,
+                    sequence_id=sequence_id,
+                    batch_index=batch_index,
+                )
+                attempt_ids.append(attempt["id"])
                 if executed_payloads:
                     stop_reason = "action_error"
                     break
-                return self._error_payload(f"{type(exc).__name__}: {exc}")
+                record_sequence(
+                    self.ledger,
+                    sequence_id=sequence_id,
+                    requested_actions=requested_displays,
+                    attempt_ids=attempt_ids,
+                    stopped_early=True,
+                    stop_reason="engine_rejected",
+                )
+                self.write_runtime_state()
+                return self._error_payload(message, outcome="engine_rejected", attempt=attempt)
             executed_payloads.append(payload)
+            if payload.get("attempt_id"):
+                attempt_ids.append(str(payload["attempt_id"]))
             total_reward += float(payload.get("reward", 0.0) or 0.0)
 
             if payload.get("run_complete"):
@@ -656,7 +918,20 @@ class _HarnessGameSession:
                 break
 
         if not executed_payloads:
-            return self._error_payload("No action was executed.")
+            record_sequence(
+                self.ledger,
+                sequence_id=sequence_id,
+                requested_actions=requested_displays,
+                attempt_ids=attempt_ids,
+                stopped_early=True,
+                stop_reason=stop_reason or "govern_suppressed",
+            )
+            self.write_runtime_state()
+            return self._error_payload(
+                "No action was executed.",
+                outcome="govern_suppressed",
+                attempt=last_nonexecuted_attempt,
+            )
 
         final_payload = dict(executed_payloads[-1])
         final_payload["reward"] = total_reward
@@ -673,14 +948,60 @@ class _HarnessGameSession:
             bool(item.get("board_changed")) for item in executed_payloads
         )
         final_payload["stopped_early"] = len(executed_payloads) < batch_size
+        final_payload["sequence_id"] = sequence_id
+        final_payload["attempt_ids"] = attempt_ids
+        final_payload["transition_results"] = [
+            dict(item.get("telemetry") or {}) for item in executed_payloads
+        ]
+        outcomes = [str(item.get("outcome") or "") for item in executed_payloads]
+        if "executed_task_progress" in outcomes:
+            final_payload["outcome"] = "executed_task_progress"
+        elif "executed_terminal_failure" in outcomes:
+            final_payload["outcome"] = "executed_terminal_failure"
+        elif "executed_observable_change" in outcomes:
+            final_payload["outcome"] = "executed_observable_change"
+        else:
+            final_payload["outcome"] = "executed_no_observable_change"
         if stop_reason is not None:
             final_payload["stop_reason"] = stop_reason
+        sequence_record = record_sequence(
+            self.ledger,
+            sequence_id=sequence_id,
+            requested_actions=requested_displays,
+            attempt_ids=attempt_ids,
+            stopped_early=len(executed_payloads) < batch_size,
+            stop_reason=stop_reason,
+        )
+        finalize_incomplete_sequence_hypotheses(
+            self.ledger,
+            sequence_id=sequence_id,
+            stopped_early=bool(sequence_record["stopped_early"]),
+        )
+        self.hypotheses = sync_legacy_hypotheses(self.ledger)
+        self.write_runtime_state()
         self.write_viewer_payload()
         return final_payload
 
     def _execute_auto_reset(self) -> None:
+        self.sync_runtime_memory_from_disk()
+        sequence_id = next_sequence_id(self.ledger)
         action = arcengine.ActionInput(id=arcengine.GameAction.RESET, data={})
-        self._execute_action(action, batch_index=1, batch_size=1, generated_tokens=0)
+        payload = self._execute_action(
+            action,
+            batch_index=1,
+            batch_size=1,
+            sequence_id=sequence_id,
+            generated_tokens=0,
+        )
+        record_sequence(
+            self.ledger,
+            sequence_id=sequence_id,
+            requested_actions=["RESET"],
+            attempt_ids=[str(payload.get("attempt_id"))] if payload.get("attempt_id") else [],
+            stopped_early=False,
+            stop_reason=None,
+        )
+        self.write_runtime_state()
 
     def _execute_action(
         self,
@@ -688,6 +1009,7 @@ class _HarnessGameSession:
         *,
         batch_index: int,
         batch_size: int,
+        sequence_id: str,
         generated_tokens: int | None = None,
         flush_viewer_payload: bool = True,
     ) -> dict[str, Any]:
@@ -714,7 +1036,6 @@ class _HarnessGameSession:
         self.history_entries.append(
             HistoryEntry(action=action_display, frame=current_frame)
         )
-        self.write_runtime_state()
 
         completed = int(new_state.levels_completed)
         reward = float(completed - previous_completed) / max(
@@ -727,52 +1048,113 @@ class _HarnessGameSession:
         )
         after_frame = current_frame
         reward_delta = reward
-        no_progress_streak = int(self.telemetry.get("no_progress_streak", 0) or 0)
+        task_no_progress_streak = int(
+            self.telemetry.get(
+                "task_no_progress_streak",
+                self.telemetry.get("no_progress_streak", 0),
+            )
+            or 0
+        )
+        observable_no_change_streak = int(
+            self.telemetry.get("observable_no_change_streak", 0) or 0
+        )
         repeated_action_streak = int(self.telemetry.get("repeated_action_streak", 0) or 0)
         if previous_action and action_display == previous_action:
             repeated_action_streak += 1
         else:
             repeated_action_streak = 0
-        after_hash = frame_state_hash(after_frame)
-        known_hashes = list(self.telemetry.get("state_hashes", []))
+        after_hash = frame_observation_hash(after_frame)
+        valid_actions_after = to_model_actions(_engine_action_names(self.game))
+        known_hashes = list(
+            self.telemetry.get(
+                "observation_hashes",
+                self.telemetry.get("state_hashes", []),
+            )
+        )
         observation = transition_observation(
             before_frame,
             after_frame,
             action=action_display,
             valid_actions_before=valid_actions_before,
-            valid_actions_after=to_model_actions(_engine_action_names(self.game)),
+            valid_actions_after=valid_actions_after,
             reward=reward,
             reward_delta=reward_delta,
             level_completed=level_completed,
             game_over=raw_state == arcengine.GameState.GAME_OVER,
             run_complete=raw_state == arcengine.GameState.WIN,
             previous_action=previous_action,
-            no_progress_streak=no_progress_streak,
+            no_progress_streak=task_no_progress_streak,
             recent_actions=known_hashes,
         )
-        if observation["gameplay_changed"] or reward_delta or level_completed:
-            no_progress_streak = 0
-        observation["no_progress_streak"] = no_progress_streak
+        observation["action_id"] = action.id.name
         observation["action_type"] = action_type(action_display)
         observation["action_type_valid"] = (
             True if action.id.name == "RESET" else action_type(action_display) in set(valid_actions_before)
         )
         observation["last_action_in_valid_action"] = observation["action_type_valid"]
-        if reward_delta or level_completed or raw_state == arcengine.GameState.WIN or observation["gameplay_changed"]:
-            no_progress_streak = 0
+        if observation["progress_changed"]:
+            task_no_progress_streak = 0
         else:
-            no_progress_streak += 1
-        observation["no_progress_streak"] = no_progress_streak
+            task_no_progress_streak += 1
+        if observation["state_changed"]:
+            observable_no_change_streak = 0
+        else:
+            observable_no_change_streak += 1
+        observation["task_no_progress_streak"] = task_no_progress_streak
+        observation["observable_no_change_streak"] = observable_no_change_streak
+        # Compatibility alias now has strict task-progress semantics.
+        observation["no_progress_streak"] = task_no_progress_streak
         observation["repeated_action_streak"] = repeated_action_streak
         observation["environment_step_before"] = before_frame.step
         observation["environment_step_after"] = after_frame.step
         observation["same_state_seen_before"] = bool(after_hash and after_hash in known_hashes)
-        self.hypotheses = apply_transition_to_hypotheses(self.hypotheses, observation)
+        observation["sequence_id"] = sequence_id
+        observation["batch_index"] = batch_index
+        observation["batch_size"] = batch_size
+        outcome = classify_executed_outcome(observation)
+        observation["outcome"] = outcome
+        action_data = (
+            _model_mouse_action_data(action.data)
+            if action.id == arcengine.GameAction.ACTION6
+            else dict(action.data)
+        )
+        attempt = record_action_attempt(
+            self.ledger,
+            requested_action=action.id.name,
+            action_id=action.id.name,
+            action_data=action_data,
+            level=before_frame.level,
+            step=before_frame.step,
+            observation_hash_before=frame_observation_hash(before_frame),
+            advertised_actions=valid_actions_before,
+            outcome=outcome,
+            executed=True,
+            observation=observation,
+            sequence_id=sequence_id,
+            batch_index=batch_index,
+        )
+        observe_action_availability(
+            self.ledger,
+            level=after_frame.level,
+            advertised_actions=valid_actions_after,
+            step=after_frame.step,
+        )
+        observation["attempt_id"] = attempt["id"]
+        observation["information_gain"] = attempt["information_gain"]
+        verify_open_hypotheses(
+            self.ledger,
+            observation,
+            sequence_id=sequence_id,
+        )
+        self.hypotheses = sync_legacy_hypotheses(self.ledger)
         self.telemetry["action_count"] = self.action_count
-        self.telemetry["no_progress_streak"] = no_progress_streak
+        self.telemetry["task_no_progress_streak"] = task_no_progress_streak
+        self.telemetry["observable_no_change_streak"] = observable_no_change_streak
+        self.telemetry["no_progress_streak"] = task_no_progress_streak
         self.telemetry["repeated_action_streak"] = repeated_action_streak
         if after_hash:
             known_hashes.append(after_hash)
+        self.telemetry["observation_hashes"] = known_hashes[-64:]
         self.telemetry["state_hashes"] = known_hashes[-64:]
         transitions = list(self.telemetry.get("transitions", []))
         transitions.append(observation)
@@ -797,23 +1179,26 @@ class _HarnessGameSession:
             "score": completed,
             "reward": reward,
             "state": raw_state.name,
-            "valid_actions": to_model_actions(_engine_action_names(self.game)),
+            "valid_actions": valid_actions_after,
             "board_changed": board_changed,
+            "observed": True,
+            "outcome": outcome,
+            "attempt_id": attempt["id"],
+            "information_gain": attempt["information_gain"],
             "telemetry": observation,
             "last_action_in_valid_action": observation["action_type_valid"],
             "action_type_valid": observation["action_type_valid"],
-            "no_progress_streak": no_progress_streak,
+            "no_progress_streak": task_no_progress_streak,
+            "task_no_progress_streak": task_no_progress_streak,
+            "observable_no_change_streak": observable_no_change_streak,
             "done": raw_state == arcengine.GameState.WIN,
             "level_completed": level_completed,
             "game_over": raw_state == arcengine.GameState.GAME_OVER,
             "run_complete": raw_state == arcengine.GameState.WIN,
             "action_name": action.id.name,
-            "action_data": (
-                _model_mouse_action_data(action.data)
-                if action.id == arcengine.GameAction.ACTION6
-                else dict(action.data)
-            ),
+            "action_data": action_data,
             "action_display": action_display,
+            "sequence_id": sequence_id,
             "batch_index": batch_index,
             "batch_size": batch_size,
             **self.timing_payload(),

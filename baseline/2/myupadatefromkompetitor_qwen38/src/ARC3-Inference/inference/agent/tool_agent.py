@@ -35,10 +35,10 @@ from inference.agent.runtime_state import (
     HistoryEntry,
     RUNTIME_STATE_FILENAME,
     load_runtime_memory,
-    apply_transition_to_hypotheses,
     record_expectation,
     load_runtime_state,
 )
+from inference.agent.epistemic_ledger import compact_inform_view
 from inference.utils.openai_compat import build_chat_payload, build_headers
 
 log = logging.getLogger(__name__)
@@ -162,12 +162,13 @@ _RESPONSE_META_MAX_CHARS = 4000
 _PYTHON_TOOL_DESCRIPTION = (
     "Run one ephemeral Python snippet against preloaded ASCII game state. Available globals: "
     "`current_frame`, `previous_frame`, `history`, `transitions`, `last_transition`, "
-    "`valid_actions`, `last_action_result`, "
+    "`valid_actions`, `last_action_result`, `ledger`, `ledger_validation`, `execution_ledger`, "
+    "`world_model_ledger`, `verification_ledger`, `coverage_ledger`, "
     "and `action(actions)` for executing one or more real environment actions. "
     "`current_frame` and each `history[*].frame` expose only `.ascii`, `.segmentation`, `.step`, and `.level`; "
     "`history[-1].frame` is the current post-action frame, not the previous frame. "
     "For before/after diffs, compare `previous_frame` to `current_frame` or use `last_transition.before_frame` and `.after_frame`. "
-    "For MOUSE, pass `row` and `col` integer fields; legacy x/y fields are rejected. "
+    "For canonical ACTION6, pass `row` and `col` integer fields; legacy x/y fields are rejected. "
     "The raw numeric grid is not available. Use `.segmentation` as the primary view; use `.ascii` only to read a small, specific region. "
     "Use `print(...)` for compact output or assign final data to `result`."
 )
@@ -1228,15 +1229,15 @@ class ToolAgent:
             [
                 state_line,
                 f"Valid actions right now: {_format_valid_action_line(valid_actions)}.",
-                "Only tool: `python`. It receives `current_frame`, `previous_frame`, `history`, `transitions`, `last_transition`, `valid_actions`, `last_action_result`, `runtime_memory`, `telemetry`, `hypotheses`, `level_transition`, `last_action_in_valid_action`, and `action(actions)`.",
+                "Only tool: `python`. It receives `current_frame`, `previous_frame`, `history`, `transitions`, `last_transition`, `valid_actions`, `last_action_result`, `runtime_memory`, `telemetry`, `ledger`, `ledger_validation`, `execution_ledger`, `world_model_ledger`, `verification_ledger`, `coverage_ledger`, `hypotheses`, `level_transition`, `last_action_in_valid_action`, `record_hypothesis(...)`, and `action(actions)`.",
                 "Only letter-coded board views and lightweight metadata are exposed; raw numeric color IDs are not available.",
                 "Keep tool output compact: use `current_frame.segmentation` as the primary view, and `current_frame.ascii` only for a small specific region; never print full boards.",
                 "For the most recent change, compare `previous_frame` to `current_frame`, or `last_transition.before_frame` to `last_transition.after_frame`; `history[-1].frame` is the current frame, not the previous one.",
                 "Use Python to inspect the evidence, refine that world model from the newest history, and search or score candidate actions or short sequences against the current goal as you currently understand it.",
-                "Maintain a compact working world model of what the current level seems to contain, what actions appear to do, what the goal seems to be, what is still uncertain, and what plan currently looks best.",
-                "Treat `last_action_result` and `runtime_memory.telemetry` as authoritative transition evidence. Before choosing another action, inspect `last_action_result` fields `action_type`, `action_type_valid`, `gameplay_changed`, `hud_changed`, `progress_changed`, `same_state_seen_before`, and streaks; do not compare coordinate payloads to action type names.",
+                "Use the structured ledger for authoritative facts and evidence: action meanings are learned per game by default, while availability, target, and preconditions can vary by level or state. Interface hints are priors, not facts.",
+                "Treat `last_action_result`, `execution_ledger`, and `runtime_memory.telemetry` as authoritative transition evidence. Distinguish not-advertised, adapter/parameter/engine failure, executed no-observable-change, observable change, task progress, and terminal failure.",
                 "Model combinations as causal action sequences, not labels: write target Y, prerequisite state X, action order, expected transition after each step, and evidence. A step can be useful preparation even when it gives no immediate reward. Reuse tested sequences only in matching state context; reject unchanged retries that previously failed.",
-                "Below you are provided with the current world model from the previous turn. The default behavior is to copy it and add or remove things based on the evidence that you gathered. BEFORE EXECUTING NEW ACTIONS YOU MUST ALWAYS GIVE THE REVISED VERSION OF THE WORLD MODEL.",
+                "Free-text working notes below are optional and non-authoritative; revise them when useful, while recording testable claims and observable predictions in `record_hypothesis(...)`.",
             ]
         )
         lines.append(
@@ -1244,7 +1245,7 @@ class ToolAgent:
             "but stop immediately if a result reports `game_over`, `run_complete`, `level_completed`, or `done`."
         )
         lines.extend(self._summarized_knowledge_lines())
-        lines.append("end of world model. ")
+        lines.append("end of optional working notes. ")
         if action_num == 0:
             lines.append(
                 "Ground yourself in `current_frame` before acting, but start with a compact structural summary rather than restating the full frame."
@@ -1261,8 +1262,8 @@ class ToolAgent:
                 TOOL_CALL_FORMAT_GUIDANCE,
             ]
         )
-        if "MOUSE" in _normalize_valid_actions(valid_actions):
-            lines.append("If you use MOUSE, include integer row and col arguments.")
+        if "ACTION6" in _normalize_valid_actions(valid_actions):
+            lines.append("If you use ACTION6, include integer row and col arguments.")
         return "\n".join(lines)
 
     def _tools(self, state_path: Path) -> list[dict[str, Any]]:
@@ -1412,8 +1413,8 @@ class ToolAgent:
                 if not action_name:
                     raise ValueError(f"Action {index} is missing an `action` field.")
                 entry = {"action": action_name}
-                if action_name.upper() == "MOUSE" and ("x" in item or "y" in item):
-                    raise ValueError(f"Action {index} uses legacy MOUSE x/y fields; use row and col.")
+                if to_engine_action(action_name) == "ACTION6" and ("x" in item or "y" in item):
+                    raise ValueError(f"Action {index} uses legacy ACTION6 x/y fields; use row and col.")
                 if "row" in item:
                     entry["row"] = item.get("row")
                 if "col" in item:
@@ -1424,23 +1425,33 @@ class ToolAgent:
         return normalized
 
     def _compact_action_result(self, payload: dict[str, Any]) -> dict[str, Any]:
+        def optional_bool(key: str) -> bool | None:
+            value = payload.get(key)
+            return None if value is None else bool(value)
+
         compact = {
-            "executed": bool(payload.get("executed")),
+            "executed": optional_bool("executed"),
+            "observed": optional_bool("observed"),
+            "outcome": payload.get("outcome"),
             "action_num": payload.get("action_num"),
             "level": payload.get("level"),
             "score": payload.get("score"),
             "reward": payload.get("reward"),
             "state": payload.get("state"),
             "valid_actions": payload.get("valid_actions", []),
-            "board_changed": bool(payload.get("board_changed")),
+            "board_changed": optional_bool("board_changed"),
             "no_progress_streak": payload.get("no_progress_streak"),
             "repeated_action_streak": (payload.get("telemetry") or {}).get("repeated_action_streak"),
             "same_state_seen_before": (payload.get("telemetry") or {}).get("same_state_seen_before"),
-            "done": bool(payload.get("done")),
-            "level_completed": bool(payload.get("level_completed")),
-            "game_over": bool(payload.get("game_over")),
-            "run_complete": bool(payload.get("run_complete")),
+            "done": optional_bool("done"),
+            "level_completed": optional_bool("level_completed"),
+            "game_over": optional_bool("game_over"),
+            "run_complete": optional_bool("run_complete"),
             "action_display": payload.get("action_display") or payload.get("action_name"),
+            "action_data": payload.get("action_data"),
+            "attempt_id": payload.get("attempt_id"),
+            "information_gain": payload.get("information_gain"),
+            "sequence_id": payload.get("sequence_id"),
         }
         telemetry = payload.get("telemetry")
         if isinstance(telemetry, dict):
@@ -1453,9 +1464,16 @@ class ToolAgent:
                 "state_changed",
                 "same_state_seen_before",
                 "no_progress_streak",
+                "task_no_progress_streak",
+                "observable_no_change_streak",
                 "repeated_action_streak",
                 "changed_cell_count",
                 "object_changes",
+                "observation_hash_before",
+                "observation_hash_after",
+                "outcome",
+                "attempt_id",
+                "information_gain",
             ):
                 if key in telemetry:
                     compact[key] = telemetry[key]
@@ -1473,6 +1491,14 @@ class ToolAgent:
             compact["stop_reason"] = payload.get("stop_reason")
         if payload.get("stop_detail"):
             compact["stop_detail"] = payload.get("stop_detail")
+        transition_results = payload.get("transition_results")
+        if isinstance(transition_results, list):
+            compact["transition_results"] = [
+                dict(item) for item in transition_results if isinstance(item, dict)
+            ]
+        for list_key in ("attempt_ids", "requested_actions"):
+            if isinstance(payload.get(list_key), list):
+                compact[list_key] = list(payload[list_key])
         for timing_key in ("run_elapsed_seconds", "time_remaining_seconds"):
             if timing_key in payload:
                 compact[timing_key] = payload.get(timing_key)
@@ -1509,11 +1535,18 @@ class ToolAgent:
                 if isinstance(last_action_result, dict)
                 else self._last_action_result
             )
+            runtime_memory = load_runtime_memory(state_path)
+            current_level = refreshed_frame.level if refreshed_frame is not None else 1
+            runtime_memory["ledger_inform"] = compact_inform_view(
+                runtime_memory.get("ledger") or {},
+                current_level=current_level,
+                valid_actions=sanitized_actions,
+            )
             return {
                 "current_frame": current_frame_payload,
                 "history": _ascii_history_view_payload(refreshed_history),
                 "valid_actions": sanitized_actions,
-                "runtime_memory": load_runtime_memory(state_path),
+                "runtime_memory": runtime_memory,
                 "last_action_result": (
                     dict(persisted_action_result)
                     if isinstance(persisted_action_result, dict)
@@ -1532,13 +1565,15 @@ class ToolAgent:
                 reason = _terminal_action_reason(terminal_action_result) or "terminal_state"
                 compact_payload = {
                     "executed": False,
+                    "observed": False,
+                    "outcome": "govern_suppressed",
                     "action_num": terminal_action_result.get("action_num"),
                     "level": terminal_action_result.get("level"),
                     "score": terminal_action_result.get("score"),
                     "reward": 0.0,
                     "state": terminal_action_result.get("state"),
                     "valid_actions": [],
-                    "board_changed": False,
+                    "board_changed": None,
                     "done": bool(terminal_action_result.get("done")),
                     "level_completed": bool(terminal_action_result.get("level_completed")),
                     "game_over": bool(terminal_action_result.get("game_over")),
@@ -1579,7 +1614,11 @@ class ToolAgent:
             expectation = dict(expectation)
             expectation.setdefault("step", current_frame.step if current_frame else None)
             expectation.setdefault("level", current_frame.level if current_frame else None)
-            return record_expectation(state_path, expectation)
+            recorded = record_expectation(state_path, expectation)
+            return {
+                "expectation": recorded,
+                "state": _serialized_runtime_state(),
+            }
 
         sandbox_result = run_sandboxed_python(
             code=code,

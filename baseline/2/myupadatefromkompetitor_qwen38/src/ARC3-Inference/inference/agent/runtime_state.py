@@ -10,12 +10,20 @@ from typing import Any
 from inference.utils.grid_utils import format_grid_ascii
 from inference.utils.grid_utils import ARC_COLOR_CHARS
 from inference.utils.segmentation import segment_layer
+from inference.agent.epistemic_ledger import (
+    ensure_ledger,
+    new_ledger,
+    record_hypothesis,
+    ledger_validation_report,
+    sync_legacy_hypotheses,
+    verify_open_hypotheses,
+)
 
 
 RUNTIME_STATE_FILENAME = "tool_runtime_state.json"
 
 
-def frame_state_hash(frame: "Frame | None") -> str | None:
+def frame_observation_hash(frame: "Frame | None") -> str | None:
     if frame is None:
         return None
     payload = json.dumps(
@@ -24,6 +32,11 @@ def frame_state_hash(frame: "Frame | None") -> str | None:
         sort_keys=True,
     ).encode("utf-8")
     return hashlib.sha256(payload).hexdigest()[:16]
+
+
+# Backwards-compatible name.  A frame hash identifies an observation, not a
+# complete latent environment state.
+frame_state_hash = frame_observation_hash
 
 
 def _changed_cells(before: "Frame | None", after: "Frame | None") -> list[tuple[int, int]]:
@@ -44,35 +57,228 @@ def _object_summary(frame: "Frame | None") -> dict[str, dict[str, Any]]:
     if frame is None or not frame.grid or not frame.grid[0]:
         return {}
     nodes = segment_layer(frame.grid, ARC_COLOR_CHARS)["nodes"]
+    frame_area = max(1, frame.shape[0] * frame.shape[1])
     counts: dict[str, int] = {}
     result: dict[str, dict[str, Any]] = {}
     for node in nodes:
         base = f"{node['color']}:{node['hash']}"
         ordinal = counts.get(base, 0)
         counts[base] = ordinal + 1
-        result[f"{base}:{ordinal}"] = {
+        object_id = f"{base}:{ordinal}"
+        boundary = node["boundary"]
+        rows = [int(point[0]) for point in boundary] if boundary else []
+        cols = [int(point[1]) for point in boundary] if boundary else []
+        bbox = [
+            min(rows, default=0),
+            min(cols, default=0),
+            max(rows, default=0),
+            max(cols, default=0),
+        ]
+        result[object_id] = {
+            "observation_object_id": object_id,
             "color": node["color"],
             "hash": node["hash"],
             "pixels": node["pixels"],
-            "boundary": node["boundary"],
+            "boundary": boundary,
+            "bbox": bbox,
+            "centroid": [
+                (bbox[0] + bbox[2]) / 2.0,
+                (bbox[1] + bbox[3]) / 2.0,
+            ],
+            "is_background_candidate": bool(
+                int(node["pixels"]) >= frame_area * 0.5
+                and bbox[0] == 0
+                and bbox[1] == 0
+                and bbox[2] >= frame.shape[0] - 1
+                and bbox[3] >= frame.shape[1] - 1
+            ),
         }
     return result
 
 
-def _object_changes(before: "Frame | None", after: "Frame | None") -> dict[str, list[dict[str, Any]]]:
-    left = _object_summary(before)
-    right = _object_summary(after)
-    added = [right[key] for key in sorted(right.keys() - left.keys())]
-    removed = [left[key] for key in sorted(left.keys() - right.keys())]
-    moved = []
-    resized = []
-    for key in sorted(left.keys() & right.keys()):
-        old, new = left[key], right[key]
-        if old["boundary"] != new["boundary"]:
-            moved.append({"before": old, "after": new})
-        elif old["pixels"] != new["pixels"]:
-            resized.append({"before": old, "after": new})
-    return {"added": added, "removed": removed, "moved": moved, "resized": resized}
+def _bbox_iou(left: dict[str, Any], right: dict[str, Any]) -> float:
+    a = left["bbox"]
+    b = right["bbox"]
+    top, left_col = max(a[0], b[0]), max(a[1], b[1])
+    bottom, right_col = min(a[2], b[2]), min(a[3], b[3])
+    intersection = max(0.0, bottom - top + 1) * max(0.0, right_col - left_col + 1)
+    area_a = max(0.0, a[2] - a[0] + 1) * max(0.0, a[3] - a[1] + 1)
+    area_b = max(0.0, b[2] - b[0] + 1) * max(0.0, b[3] - b[1] + 1)
+    union = area_a + area_b - intersection
+    return intersection / union if union else 0.0
+
+
+def _centroid_distance(left: dict[str, Any], right: dict[str, Any]) -> float:
+    return (
+        (float(left["centroid"][0]) - float(right["centroid"][0])) ** 2
+        + (float(left["centroid"][1]) - float(right["centroid"][1])) ** 2
+    ) ** 0.5
+
+
+def _identity_confidence(
+    left: dict[str, Any],
+    right: dict[str, Any],
+    *,
+    competing_pairs: int,
+    exact_shape: bool,
+) -> float:
+    overlap = _bbox_iou(left, right)
+    distance = _centroid_distance(left, right)
+    base = 0.9 if exact_shape else 0.55
+    base += min(0.08, overlap * 0.08)
+    base -= min(0.25, distance / 128.0)
+    if competing_pairs > 1:
+        base -= min(0.25, 0.05 * (competing_pairs - 1))
+    return round(max(0.1, min(0.99, base)), 3)
+
+
+def _public_object_evidence(value: dict[str, Any]) -> dict[str, Any]:
+    """Keep causal identity fields; the full boundary remains in frame history."""
+
+    return {
+        key: value.get(key)
+        for key in (
+            "observation_object_id",
+            "color",
+            "hash",
+            "pixels",
+            "bbox",
+            "centroid",
+            "is_background_candidate",
+        )
+    }
+
+
+def _object_changes(before: "Frame | None", after: "Frame | None") -> dict[str, Any]:
+    left_all = _object_summary(before)
+    right_all = _object_summary(after)
+    background_before = [
+        value for value in left_all.values() if value.get("is_background_candidate")
+    ]
+    background_after = [
+        value for value in right_all.values() if value.get("is_background_candidate")
+    ]
+    left = {
+        key: value
+        for key, value in left_all.items()
+        if not value.get("is_background_candidate")
+    }
+    right = {
+        key: value
+        for key, value in right_all.items()
+        if not value.get("is_background_candidate")
+    }
+    unmatched_left = set(left)
+    unmatched_right = set(right)
+    matched: list[tuple[str, str, float, str]] = []
+
+    # First match position-invariant shape signatures. Identical objects are
+    # paired by overlap/proximity and explicitly carry lower identity confidence.
+    exact_candidates = [
+        (
+            _bbox_iou(left[left_id], right[right_id]),
+            -_centroid_distance(left[left_id], right[right_id]),
+            left_id,
+            right_id,
+        )
+        for left_id in left
+        for right_id in right
+        if left[left_id]["color"] == right[right_id]["color"]
+        and left[left_id]["hash"] == right[right_id]["hash"]
+    ]
+    for _overlap, _negative_distance, left_id, right_id in sorted(
+        exact_candidates, reverse=True
+    ):
+        if left_id not in unmatched_left or right_id not in unmatched_right:
+            continue
+        competing = sum(
+            1
+            for item in exact_candidates
+            if item[2] == left_id or item[3] == right_id
+        )
+        matched.append(
+            (
+                left_id,
+                right_id,
+                _identity_confidence(
+                    left[left_id],
+                    right[right_id],
+                    competing_pairs=competing,
+                    exact_shape=True,
+                ),
+                "same_color_shape_nearest_match",
+            )
+        )
+        unmatched_left.remove(left_id)
+        unmatched_right.remove(right_id)
+
+    # A changed shape cannot retain the old shape hash. Only pair remaining
+    # same-color objects when their boxes overlap, avoiding confident false
+    # movement chains between unrelated objects.
+    transform_candidates = [
+        (
+            _bbox_iou(left[left_id], right[right_id]),
+            -_centroid_distance(left[left_id], right[right_id]),
+            left_id,
+            right_id,
+        )
+        for left_id in unmatched_left
+        for right_id in unmatched_right
+        if left[left_id]["color"] == right[right_id]["color"]
+        and _bbox_iou(left[left_id], right[right_id]) > 0.0
+    ]
+    for overlap, _negative_distance, left_id, right_id in sorted(
+        transform_candidates, reverse=True
+    ):
+        if left_id not in unmatched_left or right_id not in unmatched_right:
+            continue
+        competing = sum(
+            1
+            for item in transform_candidates
+            if item[2] == left_id or item[3] == right_id
+        )
+        matched.append(
+            (
+                left_id,
+                right_id,
+                _identity_confidence(
+                    left[left_id],
+                    right[right_id],
+                    competing_pairs=competing,
+                    exact_shape=False,
+                ),
+                f"same_color_overlapping_transform_iou={overlap:.3f}",
+            )
+        )
+        unmatched_left.remove(left_id)
+        unmatched_right.remove(right_id)
+
+    moved: list[dict[str, Any]] = []
+    resized: list[dict[str, Any]] = []
+    for left_id, right_id, confidence, method in matched:
+        old, new = left[left_id], right[right_id]
+        evidence = {
+            "before": _public_object_evidence(old),
+            "after": _public_object_evidence(new),
+            "identity_confidence": confidence,
+            "match_method": method,
+        }
+        if old["hash"] != new["hash"] or old["pixels"] != new["pixels"]:
+            resized.append(evidence)
+        elif old["boundary"] != new["boundary"]:
+            moved.append(evidence)
+
+    return {
+        "added": [_public_object_evidence(right[key]) for key in sorted(unmatched_right)],
+        "removed": [_public_object_evidence(left[key]) for key in sorted(unmatched_left)],
+        "moved": moved,
+        "resized": resized,
+        "background_candidates": {
+            "before": [_public_object_evidence(item) for item in background_before],
+            "after": [_public_object_evidence(item) for item in background_after],
+            "excluded_from_object_effects": True,
+        },
+    }
 
 
 def transition_observation(
@@ -93,7 +299,7 @@ def transition_observation(
 ) -> dict[str, Any]:
     changed = _changed_cells(before, after)
     object_changes = _object_changes(before, after)
-    visual_changed = bool(changed) or frame_state_hash(before) != frame_state_hash(after)
+    visual_changed = bool(changed) or frame_observation_hash(before) != frame_observation_hash(after)
     edge_only = bool(changed) and all(
         row in {0, after.shape[0] - 1} or col in {0, after.shape[1] - 1}
         for row, col in changed
@@ -101,8 +307,8 @@ def transition_observation(
     hud_changed = visual_changed and edge_only
     gameplay_changed = visual_changed and not hud_changed
     progress_changed = bool(reward_delta or level_completed or run_complete)
-    after_hash = frame_state_hash(after)
-    before_hash = frame_state_hash(before)
+    after_hash = frame_observation_hash(after)
+    before_hash = frame_observation_hash(before)
     actions = list(recent_actions or [])
     same_state_seen_before = bool(after_hash and after_hash in actions)
     return {
@@ -110,6 +316,9 @@ def transition_observation(
         "valid_actions_before": list(valid_actions_before),
         "valid_actions_after": list(valid_actions_after),
         "last_action_in_valid_action": action in set(valid_actions_before),
+        "observation_hash_before": before_hash,
+        "observation_hash_after": after_hash,
+        # Deprecated aliases retained for old result viewers.
         "state_hash_before": before_hash,
         "state_hash_after": after_hash,
         "state_changed": before_hash != after_hash,
@@ -242,31 +451,41 @@ def load_runtime_state(path: Path) -> tuple[Frame | None, list[HistoryEntry]]:
 
 def load_runtime_memory(path: Path) -> dict[str, Any]:
     if not path.exists():
-        return {"telemetry": {}, "hypotheses": [], "level_transition": {}}
+        ledger = new_ledger()
+        return {
+            "telemetry": {},
+            "hypotheses": [],
+            "level_transition": {},
+            "ledger": ledger,
+            "ledger_validation": ledger_validation_report(ledger),
+        }
     payload = json.loads(path.read_text(encoding="utf-8"))
+    ledger = ensure_ledger(payload.get("ledger"))
+    ledger_hypotheses = sync_legacy_hypotheses(ledger)
+    legacy_hypotheses = payload.get("hypotheses") if isinstance(payload.get("hypotheses"), list) else []
+    if not ledger_hypotheses and legacy_hypotheses:
+        ledger["world_model"]["hypotheses"] = [dict(item) for item in legacy_hypotheses if isinstance(item, dict)]
+        ledger_hypotheses = sync_legacy_hypotheses(ledger)
     return {
         "telemetry": payload.get("telemetry") if isinstance(payload.get("telemetry"), dict) else {},
-        "hypotheses": payload.get("hypotheses") if isinstance(payload.get("hypotheses"), list) else [],
+        "hypotheses": ledger_hypotheses,
         "level_transition": payload.get("level_transition") if isinstance(payload.get("level_transition"), dict) else {},
+        "ledger": ledger,
+        "ledger_validation": ledger_validation_report(ledger),
     }
 
 
 def record_expectation(path: Path, expectation: dict[str, Any]) -> dict[str, Any]:
     memory = load_runtime_memory(path)
-    hypotheses = list(memory["hypotheses"])
-    next_id = max((int(item.get("id", 0) or 0) for item in hypotheses), default=0) + 1
-    item = {
-        "id": next_id,
-        "created_step": expectation.get("step"),
-        "level": expectation.get("level"),
-        "expectation": dict(expectation),
-        "reality": None,
-        "confidence_before": expectation.get("confidence"),
-        "confidence_after": None,
-        "status": "open",
-    }
-    hypotheses.append(item)
-    memory["hypotheses"] = hypotheses[-32:]
+    ledger = ensure_ledger(memory.get("ledger"))
+    item = record_hypothesis(
+        ledger,
+        dict(expectation),
+        current_step=expectation.get("step"),
+        current_level=expectation.get("level"),
+    )
+    memory["ledger"] = ledger
+    memory["hypotheses"] = sync_legacy_hypotheses(ledger)
     write_runtime_memory(path, memory)
     return item
 
@@ -274,32 +493,10 @@ def record_expectation(path: Path, expectation: dict[str, Any]) -> dict[str, Any
 def apply_transition_to_hypotheses(
     hypotheses: list[dict[str, Any]], observation: dict[str, Any]
 ) -> list[dict[str, Any]]:
-    updated = [dict(item) for item in hypotheses]
-    for item in reversed(updated):
-        if item.get("status") != "open":
-            continue
-        expected = item.get("expectation") or {}
-        reality = {
-            "action": observation.get("action"),
-            "state_changed": observation.get("state_changed"),
-            "gameplay_changed": observation.get("gameplay_changed"),
-            "hud_changed": observation.get("hud_changed"),
-            "progress_changed": observation.get("progress_changed"),
-            "reward_delta": observation.get("reward_delta"),
-            "object_changes": observation.get("object_changes"),
-        }
-        item["reality"] = reality
-        expected_gameplay = expected.get("gameplay_change")
-        if expected_gameplay is None:
-            item["status"] = "observed"
-        elif bool(expected_gameplay) == bool(reality["gameplay_changed"]):
-            item["status"] = "supported"
-            item["confidence_after"] = max(float(item.get("confidence_before") or 0.0), 0.7)
-        else:
-            item["status"] = "rejected"
-            item["confidence_after"] = min(float(item.get("confidence_before") or 0.0), 0.2)
-        break
-    return updated
+    ledger = new_ledger()
+    ledger["world_model"]["hypotheses"] = [dict(item) for item in hypotheses]
+    verify_open_hypotheses(ledger, observation)
+    return sync_legacy_hypotheses(ledger)
 
 
 def write_runtime_memory(path: Path, memory: dict[str, Any]) -> None:
@@ -311,6 +508,7 @@ def write_runtime_memory(path: Path, memory: dict[str, Any]) -> None:
         telemetry=memory.get("telemetry"),
         hypotheses=memory.get("hypotheses"),
         level_transition=memory.get("level_transition"),
+        ledger=memory.get("ledger"),
     )
 
 
@@ -322,14 +520,18 @@ def write_runtime_state(
     telemetry: dict[str, Any] | None = None,
     hypotheses: list[dict[str, Any]] | None = None,
     level_transition: dict[str, Any] | None = None,
+    ledger: dict[str, Any] | None = None,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    normalized_ledger = ensure_ledger(ledger)
     payload = {
         "current_frame": frame_to_payload(current_frame),
         "history": [history_entry_to_payload(entry) for entry in history],
         "telemetry": telemetry or {},
         "hypotheses": hypotheses or [],
         "level_transition": level_transition or {},
+        "ledger": normalized_ledger,
+        "ledger_validation": ledger_validation_report(normalized_ledger),
     }
     tmp_path = path.with_suffix(f"{path.suffix}.tmp")
     tmp_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
