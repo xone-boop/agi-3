@@ -21,6 +21,8 @@ from inference.agent.action_names import (
 )
 
 
+# The outer ledger schema remains version 1: belief revision metadata is an
+# additive extension and old sidecars must continue to load unchanged.
 LEDGER_SCHEMA_VERSION = 1
 OUTCOME_TYPES = {
     "not_advertised",
@@ -39,6 +41,68 @@ VERIFICATION_STATUSES = {
     "supported",
     "partially_supported",
     "refuted",
+}
+BELIEF_STATUSES = {
+    "candidate",
+    "supported",
+    "contested",
+    "refuted",
+    "superseded",
+    "dormant",
+}
+
+# These are fields the authoritative transition envelope can measure.  A
+# model may still record a descriptive prediction, but it cannot turn into
+# support merely because an unrelated transition happened.
+MEASURABLE_PREDICTION_ROOTS = {
+    "action",
+    "action_id",
+    "action_type",
+    "action_type_valid",
+    "outcome",
+    "state_changed",
+    "visual_changed",
+    "gameplay_changed",
+    "hud_changed",
+    "progress_changed",
+    "reward",
+    "reward_delta",
+    "level_before",
+    "level_after",
+    "level_completed",
+    "game_over",
+    "run_complete",
+    "changed_cell_count",
+    "changed_cells_sample",
+    "object_changes",
+    "observation_hash_before",
+    "observation_hash_after",
+    "state_hash_before",
+    "state_hash_after",
+    "same_action_as_previous",
+    "same_state_seen_before",
+    "no_progress_streak",
+    "task_no_progress_streak",
+    "observable_no_change_streak",
+    "repeated_action_streak",
+    "sequence_transitions",
+    "sequence_any_state_changed",
+    "sequence_any_progress_changed",
+}
+
+KIND_ALIASES = {
+    # The current prompts have produced these names in addition to the
+    # original enum-like names.  Keep the raw value for audit, but project
+    # the hypothesis into the useful derived bucket.
+    "probe": "action_function",
+    "mechanic": "action_function",
+    "action_semantics": "action_function",
+    "action_semantic": "action_function",
+    "action_effect": "action_function",
+    "action_effect_prediction": "action_function",
+    "goal": "completion_condition",
+    "completion": "completion_condition",
+    "object_affordance": "object_action_affordance",
 }
 
 
@@ -124,6 +188,57 @@ def new_ledger(*, game_id: str = "") -> dict[str, Any]:
     }
 
 
+def _canonical_hypothesis_kind(value: Any) -> tuple[str, str]:
+    """Return the projection kind plus the untouched model-provided kind."""
+
+    raw = str(value or "action_effect_prediction").strip() or "action_effect_prediction"
+    normalized = raw.lower().replace("-", "_").replace(" ", "_")
+    return KIND_ALIASES.get(normalized, normalized), raw
+
+
+def _legacy_belief_status(hypothesis: dict[str, Any]) -> str:
+    explicit = str(hypothesis.get("belief_status") or "").strip().lower()
+    if explicit in BELIEF_STATUSES:
+        return explicit
+    verification = str(hypothesis.get("verification_status") or "").lower()
+    if verification in {"supported", "partially_supported"}:
+        return "supported"
+    if verification == "refuted":
+        return "refuted"
+    return "candidate"
+
+
+def _coerce_confidence(value: Any, *, default: float = 0.5) -> float:
+    try:
+        return min(0.95, max(0.05, float(value)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _ensure_hypothesis_metadata(hypothesis: dict[str, Any]) -> None:
+    """Upgrade a legacy hypothesis in place without rewriting its evidence."""
+
+    kind, raw_kind = _canonical_hypothesis_kind(hypothesis.get("kind"))
+    hypothesis["kind"] = kind
+    hypothesis.setdefault("raw_kind", raw_kind)
+    hypothesis.setdefault("belief_status", _legacy_belief_status(hypothesis))
+    hypothesis.setdefault("revision", 0)
+    hypothesis.setdefault("revision_history", [])
+    hypothesis.setdefault("evidence_for", [])
+    hypothesis.setdefault("evidence_against", [])
+    hypothesis.setdefault("evidence_inconclusive", [])
+    hypothesis.setdefault("valid_from_step", (hypothesis.get("origin") or {}).get("step"))
+    hypothesis.setdefault("valid_to_step", None)
+    hypothesis.setdefault("supersedes", None)
+    hypothesis.setdefault("superseded_by", None)
+    initial = _coerce_confidence(
+        hypothesis.get("confidence", hypothesis.get("confidence_after", hypothesis.get("confidence_before")))
+    )
+    hypothesis.setdefault("confidence", initial)
+    hypothesis.setdefault("confidence_before", initial)
+    hypothesis.setdefault("confidence_after", hypothesis.get("confidence"))
+
+
 def ensure_ledger(value: Any, *, game_id: str = "") -> dict[str, Any]:
     """Upgrade a partial ledger without discarding already recorded evidence."""
 
@@ -162,6 +277,9 @@ def ensure_ledger(value: Any, *, game_id: str = "") -> dict[str, Any]:
         for field in fields:
             if not isinstance(target.get(field), list):
                 target[field] = []
+    for hypothesis in ledger["world_model"]["hypotheses"]:
+        if isinstance(hypothesis, dict):
+            _ensure_hypothesis_metadata(hypothesis)
     ledger["schema_version"] = LEDGER_SCHEMA_VERSION
     return ledger
 
@@ -372,7 +490,9 @@ def record_action_attempt(
         counts[outcome] = int(counts.get(outcome, 0) or 0) + 1
 
     if executed and isinstance(observation, dict):
+        attempt_number = str(attempt["id"])[1:]
         transition = {
+            "id": f"T{attempt_number}",
             "attempt_id": attempt["id"],
             "sequence_id": sequence_id,
             "batch_index": batch_index,
@@ -451,9 +571,30 @@ def _normalize_predictions(expectation: dict[str, Any]) -> list[dict[str, Any]]:
     if isinstance(raw, list):
         for item in raw:
             if isinstance(item, dict) and str(item.get("field") or "").strip():
-                predictions.append(copy.deepcopy(item))
+                predicate = copy.deepcopy(item)
+                raw_field = str(predicate.get("field") or "").strip()
+                # `board_changed` exists on the outward action payload, not
+                # the transition evidence that verifies a hypothesis.
+                # Canonicalize it before execution so it is actually tested.
+                field = "state_changed" if raw_field == "board_changed" else raw_field
+                predicate["field"] = field
+                if raw_field != field:
+                    predicate["raw_field"] = raw_field
+                root = field.split(".", 1)[0]
+                if root not in MEASURABLE_PREDICTION_ROOTS:
+                    predicate["evaluable"] = False
+                    predicate["non_evaluable_reason"] = (
+                        f"{raw_field} is not a field measured by the authoritative transition envelope."
+                    )
+                predictions.append(predicate)
             elif isinstance(item, str) and item.strip():
-                predictions.append({"description": item.strip(), "evaluable": False})
+                predictions.append(
+                    {
+                        "description": item.strip(),
+                        "evaluable": False,
+                        "non_evaluable_reason": "Prediction is descriptive but has no observable field predicate.",
+                    }
+                )
     gameplay_change = expectation.get("gameplay_change")
     if isinstance(gameplay_change, bool):
         predictions.append(
@@ -493,9 +634,16 @@ def _upsert_world_model_candidate(
             "preconditions",
             "confidence_before",
             "confidence_after",
+            "confidence",
             "status",
+            "belief_status",
             "verification_status",
             "verification_reason",
+            "raw_kind",
+            "revision",
+            "evidence_for",
+            "evidence_against",
+            "supersedes",
         )
     }
     bucket[:] = [item for item in bucket if item.get("id") != hypothesis.get("id")]
@@ -523,6 +671,38 @@ def _set_coverage_status(
         unknowns.append(item)
     item["status"] = status
     item["evidence_id"] = evidence_id
+
+
+def _mark_superseded(
+    ledger: dict[str, Any], *, hypothesis_id: str, successor_id: str, step: int | None
+) -> None:
+    """Retire an active view while preserving the original belief and evidence."""
+
+    for item in ledger["world_model"]["hypotheses"]:
+        if item.get("id") != hypothesis_id:
+            continue
+        _ensure_hypothesis_metadata(item)
+        previous = item["belief_status"]
+        item["belief_status"] = "superseded"
+        item["status"] = "closed"  # legacy lifecycle: no further automatic testing
+        item["superseded_by"] = successor_id
+        item["valid_to_step"] = step
+        item["revision"] = int(item.get("revision") or 0) + 1
+        item["revision_history"].append(
+            {
+                "revision": item["revision"],
+                "previous_belief_status": previous,
+                "belief_status": "superseded",
+                "verification_status": item.get("verification_status"),
+                "confidence_before": item.get("confidence"),
+                "confidence_after": item.get("confidence"),
+                "evidence_id": None,
+                "reason": f"Superseded by {successor_id}.",
+                "step": step,
+            }
+        )
+        _upsert_world_model_candidate(ledger, item)
+        return
 
 
 def record_hypothesis(
@@ -554,30 +734,66 @@ def record_hypothesis(
         target_binding = {"status": "undefined"}
     target_binding.setdefault("status", "candidate")
     claim = expectation.get("claim", expectation.get("effect", ""))
+    kind, raw_kind = _canonical_hypothesis_kind(expectation.get("kind"))
+    initial_confidence = _coerce_confidence(expectation.get("confidence"))
+    origin_step = expectation.get("step", current_step)
+    supersedes = expectation.get("supersedes", expectation.get("supersedes_id"))
+    supersedes = str(supersedes) if supersedes not in (None, "") else None
+    requested_belief_status = str(
+        expectation.get("belief_status", expectation.get("epistemic_status", "candidate"))
+    ).strip().lower()
+    initial_belief_status = (
+        requested_belief_status
+        if requested_belief_status in BELIEF_STATUSES
+        else "candidate"
+    )
     item = {
         "id": _next_id(hypotheses, "H"),
-        "kind": str(expectation.get("kind") or "action_effect_prediction"),
+        "kind": kind,
+        "raw_kind": raw_kind,
         "claim": copy.deepcopy(claim),
         "action_id": action_id,
         "action_sequence": sequence,
         "scope": scope,
         "origin": {
-            "step": expectation.get("step", current_step),
+            "step": origin_step,
             "level": expectation.get("level", current_level),
         },
         "target_binding": target_binding,
         "preconditions": copy.deepcopy(expectation.get("preconditions") or []),
         "predictions": _normalize_predictions(expectation),
-        "confidence_before": expectation.get("confidence"),
-        "confidence_after": None,
-        "status": "open",
+        "confidence_before": initial_confidence,
+        "confidence_after": initial_confidence,
+        "confidence": initial_confidence,
+        # Keep `status` for the old runtime contract.  `belief_status` is the
+        # versioned epistemic state used by new projections.
+        "status": "closed" if initial_belief_status in {"superseded", "dormant"} else "open",
+        "belief_status": initial_belief_status,
         "verification_status": "not_tested",
         "verification_reason": "No matching executed transition has been observed.",
         "test_progress": [],
         "test_observations": [],
         "test_sequence_id": None,
+        "revision": 0,
+        "revision_history": [],
+        "evidence_for": [],
+        "evidence_against": [],
+        "evidence_inconclusive": [],
+        "valid_from_step": origin_step,
+        "valid_to_step": None,
+        "supersedes": supersedes,
+        "superseded_by": None,
     }
-    _bounded_append(hypotheses, item, limit=64)
+    # Hypotheses and their verification history are evidence, not a compact
+    # presentation cache.  Do not evict old versions here.
+    hypotheses.append(item)
+    if supersedes:
+        _mark_superseded(
+            ledger,
+            hypothesis_id=supersedes,
+            successor_id=item["id"],
+            step=origin_step,
+        )
     _upsert_world_model_candidate(ledger, item)
     if action_id:
         _set_coverage_status(
@@ -612,7 +828,13 @@ def _evaluate_predicate(
 ) -> tuple[str, str]:
     field = str(predicate.get("field") or "").strip()
     if not field or predicate.get("evaluable") is False:
-        return "unknown", "Prediction is descriptive but has no observable field predicate."
+        return (
+            "unknown",
+            str(
+                predicate.get("non_evaluable_reason")
+                or "Prediction is descriptive but has no observable field predicate."
+            ),
+        )
     found, actual = _resolve_field(observation, field)
     if not found:
         return "unknown", f"Observation does not measure {field}."
@@ -676,6 +898,7 @@ def _store_semantic_evidence(ledger: dict[str, Any], hypothesis: dict[str, Any])
         "claim": copy.deepcopy(hypothesis.get("claim")),
         "scope": copy.deepcopy(hypothesis.get("scope")),
         "status": hypothesis.get("verification_status"),
+        "belief_status": hypothesis.get("belief_status"),
         "confidence": hypothesis.get("confidence_after"),
     }
     contract = ledger["interface"]["actions"][action_id]
@@ -685,33 +908,96 @@ def _store_semantic_evidence(ledger: dict[str, Any], hypothesis: dict[str, Any])
     ]
     existing.append(candidate)
     contract["semantic_candidates"] = existing[-16:]
-    if hypothesis.get("verification_status") in {"supported", "partially_supported"}:
+    if hypothesis.get("belief_status") == "supported":
         contract["semantic_status"] = "candidate_supported"
 
 
 def _close_inconclusive_hypothesis(
     ledger: dict[str, Any], hypothesis: dict[str, Any], *, reason: str
 ) -> None:
-    hypothesis["status"] = "closed"
+    _ensure_hypothesis_metadata(hypothesis)
+    evidence_id = _next_id(ledger["verification"]["records"], "V")
+    confidence = _coerce_confidence(hypothesis.get("confidence"))
+    record = {
+        "id": evidence_id,
+        "hypothesis_id": hypothesis["id"],
+        "status": "inconclusive",
+        "reason": reason,
+        "evaluations": [],
+        "actual": {
+            "observed_action_sequence": list(hypothesis.get("test_progress") or []),
+            "sequence_id": hypothesis.get("test_sequence_id"),
+        },
+    }
+    ledger["verification"]["records"].append(record)
+    hypothesis["revision"] = int(hypothesis.get("revision") or 0) + 1
+    hypothesis["revision_history"].append(
+        {
+            "revision": hypothesis["revision"],
+            "previous_belief_status": hypothesis["belief_status"],
+            "belief_status": hypothesis["belief_status"],
+            "verification_status": "inconclusive",
+            "confidence_before": confidence,
+            "confidence_after": confidence,
+            "evidence_id": evidence_id,
+            "reason": reason,
+            "step": None,
+        }
+    )
+    hypothesis["evidence_inconclusive"].append(evidence_id)
+    # A stopped or divergent sequence says nothing about the reusable claim.
+    # It stays open for a later complete experiment under the legacy contract.
+    hypothesis["status"] = "open"
     hypothesis["verification_status"] = "inconclusive"
     hypothesis["verification_reason"] = reason
-    hypothesis["confidence_after"] = hypothesis.get("confidence_before")
-    _bounded_append(
-        ledger["verification"]["records"],
-        {
-            "id": _next_id(ledger["verification"]["records"], "V"),
-            "hypothesis_id": hypothesis["id"],
-            "status": "inconclusive",
-            "reason": reason,
-            "evaluations": [],
-            "actual": {
-                "observed_action_sequence": list(hypothesis.get("test_progress") or []),
-                "sequence_id": hypothesis.get("test_sequence_id"),
-            },
-        },
-        limit=128,
-    )
+    hypothesis["confidence_after"] = confidence
+    hypothesis["confidence"] = confidence
+    hypothesis["test_progress"] = []
+    hypothesis["test_observations"] = []
+    hypothesis["test_sequence_id"] = None
     _upsert_world_model_candidate(ledger, hypothesis)
+
+
+def _observation_step(observation: dict[str, Any]) -> int | None:
+    for key in ("environment_step_after", "step", "environment_step_before"):
+        try:
+            if observation.get(key) is not None:
+                return int(observation[key])
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _belief_status_from_evidence(hypothesis: dict[str, Any]) -> str:
+    supported = len(hypothesis.get("evidence_for") or [])
+    contradicted = len(hypothesis.get("evidence_against") or [])
+    if contradicted >= 2 and contradicted > supported:
+        return "refuted"
+    if contradicted:
+        return "contested"
+    if supported:
+        return "supported"
+    return "candidate"
+
+
+def _revised_confidence(
+    current: float, *, verification_status: str, belief_status: str
+) -> float:
+    """Use deliberately small evidence steps; one transition never settles a mechanic."""
+
+    if verification_status == "supported":
+        delta = 0.08
+    elif verification_status == "partially_supported":
+        delta = 0.04
+    elif verification_status == "refuted":
+        delta = -0.10
+    else:
+        delta = 0.0
+    # Continued contradiction is slightly stronger evidence, still not a
+    # collapse to certainty because hidden state/preconditions are common.
+    if verification_status == "refuted" and belief_status == "refuted":
+        delta -= 0.03
+    return min(0.95, max(0.05, round(current + delta, 4)))
 
 
 def _finalize_hypothesis_verification(
@@ -779,22 +1065,7 @@ def _finalize_hypothesis_verification(
     else:
         status = "refuted"
         reason = "The matching executed transition contradicted the observable prediction."
-    hypothesis["status"] = "closed"
-    hypothesis["verification_status"] = status
-    hypothesis["verification_reason"] = reason
-    before = hypothesis.get("confidence_before")
-    try:
-        base = float(before) if before is not None else 0.5
-    except (TypeError, ValueError):
-        base = 0.5
-    if status == "supported":
-        hypothesis["confidence_after"] = max(base, 0.75)
-    elif status == "partially_supported":
-        hypothesis["confidence_after"] = min(max(base, 0.45), 0.7)
-    elif status == "refuted":
-        hypothesis["confidence_after"] = min(base, 0.2)
-    else:
-        hypothesis["confidence_after"] = base
+    _ensure_hypothesis_metadata(hypothesis)
     record = {
         "id": _next_id(ledger["verification"]["records"], "V"),
         "hypothesis_id": hypothesis["id"],
@@ -818,14 +1089,65 @@ def _finalize_hypothesis_verification(
             if key in verification_observation
         },
     }
-    _bounded_append(ledger["verification"]["records"], record, limit=128)
+    # Verification records are immutable evidence.  Do not replace the first
+    # supporting transition with a later contradiction (or vice versa).
+    ledger["verification"]["records"].append(record)
+    evidence_id = record["id"]
+    if status in {"supported", "partially_supported"}:
+        hypothesis["evidence_for"].append(evidence_id)
+    elif status == "refuted":
+        hypothesis["evidence_against"].append(evidence_id)
+    else:
+        hypothesis["evidence_inconclusive"].append(evidence_id)
+
+    previous_belief_status = hypothesis["belief_status"]
+    if previous_belief_status in {"superseded", "dormant"}:
+        belief_status = previous_belief_status
+    else:
+        belief_status = _belief_status_from_evidence(hypothesis)
+    confidence_before = _coerce_confidence(hypothesis.get("confidence"))
+    confidence_after = _revised_confidence(
+        confidence_before,
+        verification_status=status,
+        belief_status=belief_status,
+    )
+    hypothesis["revision"] = int(hypothesis.get("revision") or 0) + 1
+    hypothesis["revision_history"].append(
+        {
+            "revision": hypothesis["revision"],
+            "previous_belief_status": previous_belief_status,
+            "belief_status": belief_status,
+            "verification_status": status,
+            "confidence_before": confidence_before,
+            "confidence_after": confidence_after,
+            "evidence_id": evidence_id,
+            "reason": reason,
+            "step": _observation_step(verification_observation),
+        }
+    )
+    hypothesis["belief_status"] = belief_status
+    hypothesis["status"] = "closed" if belief_status in {"superseded", "dormant"} else "open"
+    hypothesis["verification_status"] = status
+    hypothesis["verification_reason"] = reason
+    hypothesis["confidence"] = confidence_after
+    hypothesis["confidence_after"] = confidence_after
+    if belief_status == "refuted":
+        hypothesis["valid_to_step"] = _observation_step(verification_observation)
+    elif belief_status in {"candidate", "supported", "contested"}:
+        hypothesis["valid_to_step"] = None
+
+    # A reusable complete sequence can be tested again on a new sequence.
+    if hypothesis.get("action_sequence"):
+        hypothesis["test_progress"] = []
+        hypothesis["test_observations"] = []
+        hypothesis["test_sequence_id"] = None
     _store_semantic_evidence(ledger, hypothesis)
     _upsert_world_model_candidate(ledger, hypothesis)
     action_id = hypothesis.get("action_id")
     if action_id:
         coverage_status = (
             "candidate_supported"
-            if status in {"supported", "partially_supported"}
+            if belief_status == "supported"
             else "still_unknown"
         )
         _set_coverage_status(
@@ -1009,6 +1331,23 @@ def validate_ledger(value: Any) -> list[str]:
             errors.append(
                 f"hypothesis {hypothesis.get('id', index)} has invalid verification_status {verification_status!r}"
             )
+        belief_status = hypothesis.get("belief_status")
+        if belief_status is not None and belief_status not in BELIEF_STATUSES:
+            errors.append(
+                f"hypothesis {hypothesis.get('id', index)} has invalid belief_status {belief_status!r}"
+            )
+        for prediction in hypothesis.get("predictions") or []:
+            if not isinstance(prediction, dict):
+                continue
+            field = str(prediction.get("field") or "").strip()
+            if field == "board_changed":
+                errors.append(
+                    f"hypothesis {hypothesis.get('id', index)} must normalize board_changed to state_changed"
+                )
+            elif field and field.split(".", 1)[0] not in MEASURABLE_PREDICTION_ROOTS and prediction.get("evaluable") is not False:
+                errors.append(
+                    f"hypothesis {hypothesis.get('id', index)} predicts non-measurable field {field!r} without marking it non-evaluable"
+                )
     return errors
 
 

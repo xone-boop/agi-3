@@ -298,6 +298,161 @@ class LedgerTests(unittest.TestCase):
             hypothesis["id"],
         )
 
+    def test_reusable_hypothesis_accumulates_multiple_supports(self) -> None:
+        ledger = new_ledger(game_id="g")
+        hypothesis = record_hypothesis(
+            ledger,
+            {
+                "kind": "mechanic",
+                "action": "ACTION1",
+                "claim": "ACTION1 changes the board under this scope",
+                "confidence": 0.5,
+                "predictions": [{"field": "state_changed", "op": "eq", "value": True}],
+            },
+        )
+
+        verify_open_hypotheses(ledger, {"action_id": "ACTION1", "state_changed": True})
+        verify_open_hypotheses(ledger, {"action_id": "ACTION1", "state_changed": True})
+
+        self.assertEqual(hypothesis["status"], "open")  # legacy lifecycle compatibility
+        self.assertEqual(hypothesis["belief_status"], "supported")
+        self.assertEqual(hypothesis["kind"], "action_function")
+        self.assertEqual(hypothesis["raw_kind"], "mechanic")
+        self.assertEqual(len(hypothesis["evidence_for"]), 2)
+        self.assertEqual(len(hypothesis["revision_history"]), 2)
+        self.assertAlmostEqual(hypothesis["confidence"], 0.66)
+        self.assertEqual(
+            [entry["belief_status"] for entry in hypothesis["revision_history"]],
+            ["supported", "supported"],
+        )
+        self.assertEqual(
+            ledger["world_model"]["action_functions"][-1]["id"], hypothesis["id"]
+        )
+
+    def test_contradiction_contests_but_preserves_prior_support_evidence(self) -> None:
+        ledger = new_ledger(game_id="g")
+        hypothesis = record_hypothesis(
+            ledger,
+            {
+                "kind": "action_semantics",
+                "action": "ACTION2",
+                "predictions": [{"field": "state_changed", "op": "eq", "value": True}],
+            },
+        )
+
+        verify_open_hypotheses(ledger, {"action_id": "ACTION2", "state_changed": True})
+        first_evidence = hypothesis["evidence_for"][0]
+        verify_open_hypotheses(ledger, {"action_id": "ACTION2", "state_changed": False})
+
+        self.assertEqual(hypothesis["belief_status"], "contested")
+        self.assertEqual(hypothesis["verification_status"], "refuted")
+        self.assertEqual(hypothesis["evidence_for"], [first_evidence])
+        self.assertEqual(len(hypothesis["evidence_against"]), 1)
+        self.assertEqual(hypothesis["revision_history"][0]["evidence_id"], first_evidence)
+        first_record = next(
+            item for item in ledger["verification"]["records"] if item["id"] == first_evidence
+        )
+        self.assertEqual(first_record["status"], "supported")
+
+    def test_repeated_contradictions_refute_without_deleting_history(self) -> None:
+        ledger = new_ledger(game_id="g")
+        hypothesis = record_hypothesis(
+            ledger,
+            {
+                "action": "ACTION3",
+                "predictions": [{"field": "progress_changed", "op": "eq", "value": True}],
+            },
+        )
+
+        verify_open_hypotheses(ledger, {"action_id": "ACTION3", "progress_changed": False, "step": 8})
+        self.assertEqual(hypothesis["belief_status"], "contested")
+        verify_open_hypotheses(ledger, {"action_id": "ACTION3", "progress_changed": False, "step": 9})
+
+        self.assertEqual(hypothesis["belief_status"], "refuted")
+        self.assertEqual(hypothesis["status"], "open")
+        self.assertEqual(len(hypothesis["evidence_against"]), 2)
+        self.assertEqual(len(hypothesis["revision_history"]), 2)
+        self.assertEqual(hypothesis["valid_to_step"], 9)
+
+    def test_alias_kinds_project_to_derived_buckets_without_losing_raw_kind(self) -> None:
+        ledger = new_ledger(game_id="g")
+        aliases = {
+            "probe": "action_functions",
+            "mechanic": "action_functions",
+            "action_semantics": "action_functions",
+            "goal": "completion_conditions",
+        }
+        for index, (raw_kind, bucket) in enumerate(aliases.items(), start=1):
+            hypothesis = record_hypothesis(
+                ledger,
+                {"kind": raw_kind, "action": f"ACTION{index}", "claim": raw_kind},
+            )
+            self.assertEqual(hypothesis["raw_kind"], raw_kind)
+            self.assertTrue(
+                any(item["id"] == hypothesis["id"] for item in ledger["world_model"][bucket])
+            )
+
+    def test_board_changed_alias_is_evaluable_but_unknown_fields_are_inconclusive(self) -> None:
+        ledger = new_ledger(game_id="g")
+        board_alias = record_hypothesis(
+            ledger,
+            {
+                "action": "ACTION4",
+                "predictions": [{"field": "board_changed", "op": "eq", "value": True}],
+            },
+        )
+        invalid_field = record_hypothesis(
+            ledger,
+            {
+                "action": "ACTION5",
+                "predictions": [{"field": "object_velocity", "op": "gt", "value": 0}],
+            },
+        )
+
+        self.assertEqual(board_alias["predictions"][0]["field"], "state_changed")
+        self.assertEqual(board_alias["predictions"][0]["raw_field"], "board_changed")
+        self.assertFalse(invalid_field["predictions"][0]["evaluable"])
+        self.assertIn("not a field measured", invalid_field["predictions"][0]["non_evaluable_reason"])
+        self.assertTrue(ledger_validation_report(ledger)["valid"])
+
+        verify_open_hypotheses(ledger, {"action_id": "ACTION4", "state_changed": True})
+        verify_open_hypotheses(ledger, {"action_id": "ACTION5", "state_changed": True})
+        self.assertEqual(board_alias["verification_status"], "supported")
+        self.assertEqual(invalid_field["verification_status"], "inconclusive")
+        self.assertEqual(invalid_field["belief_status"], "candidate")
+
+    def test_supersession_keeps_prior_hypothesis_and_its_history(self) -> None:
+        ledger = new_ledger(game_id="g")
+        first = record_hypothesis(
+            ledger,
+            {"action": "ACTION6", "predictions": [{"field": "state_changed", "op": "eq", "value": True}]},
+            current_step=2,
+        )
+        verify_open_hypotheses(ledger, {"action_id": "ACTION6", "state_changed": True})
+        successor = record_hypothesis(
+            ledger,
+            {
+                "action": "ACTION6",
+                "claim": "more specific replacement",
+                "supersedes": first["id"],
+            },
+            current_step=5,
+        )
+
+        self.assertEqual(first["belief_status"], "superseded")
+        self.assertEqual(first["superseded_by"], successor["id"])
+        self.assertEqual(first["valid_to_step"], 5)
+        self.assertEqual(first["revision_history"][-1]["belief_status"], "superseded")
+        self.assertEqual(len(first["evidence_for"]), 1)
+
+    def test_dormant_belief_status_is_preserved_for_scope_management(self) -> None:
+        hypothesis = record_hypothesis(
+            new_ledger(game_id="g"),
+            {"action": "ACTION1", "belief_status": "dormant"},
+        )
+        self.assertEqual(hypothesis["belief_status"], "dormant")
+        self.assertEqual(hypothesis["status"], "closed")
+
     def test_inform_view_marks_prior_separately_from_learned_semantics(self) -> None:
         view = compact_inform_view(
             new_ledger(game_id="g"),

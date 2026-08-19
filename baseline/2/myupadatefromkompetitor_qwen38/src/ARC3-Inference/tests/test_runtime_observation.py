@@ -62,7 +62,12 @@ class RuntimeObservationTests(unittest.TestCase):
         changes = _object_changes(before, after)
 
         self.assertEqual(len(changes["moved"]), 1)
-        self.assertGreater(changes["moved"][0]["identity_confidence"], 0.5)
+        movement = changes["moved"][0]
+        self.assertGreater(movement["identity_confidence"], 0.5)
+        self.assertEqual(movement["coordinate_frame"], "screen")
+        self.assertEqual(movement["delta_row"], 0.0)
+        self.assertEqual(movement["delta_col"], 1.0)
+        self.assertEqual(movement["direction"], "screen_right")
         self.assertEqual(changes["resized"], [])
         self.assertTrue(
             changes["background_candidates"]["excluded_from_object_effects"]

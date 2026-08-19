@@ -115,6 +115,33 @@ def _centroid_distance(left: dict[str, Any], right: dict[str, Any]) -> float:
     ) ** 0.5
 
 
+def _movement_measurement(
+    left: dict[str, Any], right: dict[str, Any]
+) -> dict[str, Any]:
+    """Return screen-coordinate kinematics without assigning game semantics."""
+
+    delta_row = round(float(right["centroid"][0]) - float(left["centroid"][0]), 3)
+    delta_col = round(float(right["centroid"][1]) - float(left["centroid"][1]), 3)
+    displacement = round((delta_row**2 + delta_col**2) ** 0.5, 3)
+    if delta_row == 0 and delta_col == 0:
+        direction = "stationary"
+    elif abs(delta_row) > abs(delta_col):
+        direction = "screen_down" if delta_row > 0 else "screen_up"
+    elif abs(delta_col) > abs(delta_row):
+        direction = "screen_right" if delta_col > 0 else "screen_left"
+    else:
+        vertical = "down" if delta_row > 0 else "up"
+        horizontal = "right" if delta_col > 0 else "left"
+        direction = f"screen_{vertical}_{horizontal}"
+    return {
+        "coordinate_frame": "screen",
+        "delta_row": delta_row,
+        "delta_col": delta_col,
+        "displacement": displacement,
+        "direction": direction,
+    }
+
+
 def _identity_confidence(
     left: dict[str, Any],
     right: dict[str, Any],
@@ -266,6 +293,7 @@ def _object_changes(before: "Frame | None", after: "Frame | None") -> dict[str, 
         if old["hash"] != new["hash"] or old["pixels"] != new["pixels"]:
             resized.append(evidence)
         elif old["boundary"] != new["boundary"]:
+            evidence.update(_movement_measurement(old, new))
             moved.append(evidence)
 
     return {
